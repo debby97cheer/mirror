@@ -15,13 +15,11 @@ jobs:
 
       - name: Configure Multiarch & Install ARM64 Dependencies
         run: |
-          # 1. 拦截所有默认的 x86 源，强制标记为仅限 amd64
-          # 处理 Ubuntu 24.04 的新版 ubuntu.sources 格式
+          # 1. 拦截所有默认的 x86 源
           if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
             sudo sed -i '/^Architectures:/d' /etc/apt/sources.list.d/ubuntu.sources
             sudo sed -i 's/^Types: deb/Types: deb\nArchitectures: amd64/g' /etc/apt/sources.list.d/ubuntu.sources
           fi
-          # 处理所有旧版 .list 格式 (彻底干掉 security.ubuntu.com 和云厂商镜像的 404 报错)
           sudo find /etc/apt -type f -name "*.list" -exec sed -i -E 's/^deb (http|https)/deb [arch=amd64] \1/g' {} +
 
           # 2. 注入 ARM64 专属的 ports 源
@@ -34,7 +32,7 @@ jobs:
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
 
-          # 3. 启用架构并更新安装
+          # 3. 启用架构并安装底层库（新增了原生的 FFmpeg 开发包）
           sudo dpkg --add-architecture arm64
           sudo apt-get update
           sudo apt-get install -y \
@@ -53,20 +51,25 @@ jobs:
             libusb-1.0-0-dev:arm64 \
             libva-dev:arm64 \
             libva-drm2:arm64 \
+            libavcodec-dev:arm64 \
+            libavformat-dev:arm64 \
+            libavutil-dev:arm64 \
+            libswscale-dev:arm64 \
+            libavfilter-dev:arm64 \
             glslang-tools
-            
+
       - name: Configure CMake
         env:
           PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
           PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
         run: |
+          # 删除了欺骗链接器的黑客参数，并将 YUZU_USE_BUNDLED_FFMPEG 改为 OFF
           cmake -B build -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
             -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
-            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--defsym=vaMapBuffer2=malloc" \
             -DOPENSSL_ROOT_DIR=/usr/lib/aarch64-linux-gnu \
             -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/aarch64-linux-gnu/libcrypto.so \
             -DOPENSSL_SSL_LIBRARY=/usr/lib/aarch64-linux-gnu/libssl.so \
@@ -86,7 +89,7 @@ jobs:
             -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF \
             -DYUZU_ENABLE_COMPATIBILITY_REPORTING=OFF \
             -DENABLE_FFMPEG=ON \
-            -DYUZU_USE_BUNDLED_FFMPEG=ON \
+            -DYUZU_USE_BUNDLED_FFMPEG=OFF \
             -DYUZU_TESTS=OFF > cmake_log.txt 2>&1 || {
               echo "======================================"
               echo "❌ CMAKE 编译失败！自动提取真实报错... ❌"
