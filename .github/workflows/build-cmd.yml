@@ -50,6 +50,7 @@ jobs:
             libx11-dev:arm64 \
             libxext-dev:arm64 \
             libwayland-dev:arm64 \
+            libusb-1.0-0-dev:arm64 \
             glslang-tools
             
       - name: Configure CMake
