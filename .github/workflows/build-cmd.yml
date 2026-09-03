@@ -57,6 +57,11 @@ jobs:
             -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
             -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DOPENSSL_ROOT_DIR=/usr/lib/aarch64-linux-gnu \
+            -DOPENSSL_CRYPTO_LIBRARY=/usr/lib/aarch64-linux-gnu/libcrypto.so \
+            -DOPENSSL_SSL_LIBRARY=/usr/lib/aarch64-linux-gnu/libssl.so \
+            -DOPENSSL_INCLUDE_DIR=/usr/include \
+            -DGLSLANGVALIDATOR=/usr/bin/glslangValidator \
             -DENABLE_QT=OFF \
             -DENABLE_SDL2=ON \
             -DSDL_UNIX_CONSOLE_BUILD=ON \
@@ -70,7 +75,13 @@ jobs:
             -DYUZU_ENABLE_COMPATIBILITY_REPORTING=OFF \
             -DENABLE_FFMPEG=ON \
             -DYUZU_USE_BUNDLED_FFMPEG=ON \
-            -DYUZU_TESTS=OFF 2>&1
+            -DYUZU_TESTS=OFF > cmake_log.txt 2>&1 || {
+              echo "======================================"
+              echo "❌ CMAKE 编译失败！自动提取真实报错... ❌"
+              echo "======================================"
+              grep -i -B 5 -A 15 "CMake Error" cmake_log.txt || tail -n 30 cmake_log.txt
+              exit 1
+            }
 
       - name: Compile CLI Target
         run: |
