@@ -45,6 +45,7 @@ jobs:
             libasound2-dev:arm64 \
             libudev-dev:arm64 \
             libssl-dev:arm64
+            glslang-tools
 
       - name: Configure CMake
         env:
