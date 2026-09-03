@@ -73,6 +73,8 @@ jobs:
             -DSDL_UNIX_CONSOLE_BUILD=ON \
             -DSDL_KMSDRM=ON \
             -DSDL_ALSA=ON \
+            -DSDL_X11=OFF \
+            -DSDL_WAYLAND=OFF \
             -DYUZU_USE_QT_MULTIMEDIA=OFF \
             -DYUZU_USE_EXTERNAL_SDL2=OFF \
             -DYUZU_USE_X11=OFF \
