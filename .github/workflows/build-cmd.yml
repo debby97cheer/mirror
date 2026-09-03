@@ -106,7 +106,6 @@ jobs:
       - name: Package & Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: eden-cmd-aarch64
+          name: eden-cli-aarch64
           path: |
-            build/bin/eden-cmd
-            build/bin/yuzu-cmd
+            build/bin/eden-cli
