@@ -15,15 +15,16 @@ jobs:
 
       - name: Configure Multiarch & Install ARM64 Dependencies
         run: |
-          # 1. 限制默认源只抓取 amd64，避免 archive.ubuntu.com 报 404
+          # 1. 拦截所有默认的 x86 源，强制标记为仅限 amd64
+          # 处理 Ubuntu 24.04 的新版 ubuntu.sources 格式
           if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            sudo sed -i 's/Architectures: .*/Architectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
+            sudo sed -i '/^Architectures:/d' /etc/apt/sources.list.d/ubuntu.sources
+            sudo sed -i 's/^Types: deb/Types: deb\nArchitectures: amd64/g' /etc/apt/sources.list.d/ubuntu.sources
           fi
-          if [ -f /etc/apt/sources.list ]; then
-            sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-          fi
+          # 处理所有旧版 .list 格式 (彻底干掉 security.ubuntu.com 和云厂商镜像的 404 报错)
+          sudo find /etc/apt -type f -name "*.list" -exec sed -i -E 's/^deb (http|https)/deb [arch=amd64] \1/g' {} +
 
-          # 2. 添加 arm64 ports 源
+          # 2. 注入 ARM64 专属的 ports 源
           sudo tee /etc/apt/sources.list.d/arm64-ports.sources << 'EOF'
           Types: deb
           URIs: http://ports.ubuntu.com/ubuntu-ports/
@@ -33,7 +34,7 @@ jobs:
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
 
-          # 3. 启用 arm64 架构并安装底层库
+          # 3. 启用架构并更新安装
           sudo dpkg --add-architecture arm64
           sudo apt-get update
           sudo apt-get install -y \
