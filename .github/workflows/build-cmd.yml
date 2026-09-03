@@ -13,18 +13,42 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Install Toolchain & Dependencies
+      - name: Configure Multiarch & Install ARM64 Dependencies
         run: |
+          # 1. 限制默认源只抓取 amd64，避免 archive.ubuntu.com 报 404
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's/Architectures: .*/Architectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          fi
+
+          # 2. 添加 arm64 ports 源
+          sudo tee /etc/apt/sources.list.d/arm64-ports.sources << 'EOF'
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports/
+          Suites: noble noble-updates noble-security noble-backports
+          Components: main universe restricted multiverse
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+
+          # 3. 启用 arm64 架构并安装底层库
+          sudo dpkg --add-architecture arm64
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            cmake \
-            ninja-build \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            pkg-config
+            build-essential cmake ninja-build pkg-config \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libdrm-dev:arm64 \
+            libgbm-dev:arm64 \
+            libasound2-dev:arm64 \
+            libudev-dev:arm64 \
+            libssl-dev:arm64
 
       - name: Configure CMake
+        env:
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+          PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
         run: |
           cmake -B build -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -34,6 +58,9 @@ jobs:
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
             -DENABLE_QT=OFF \
             -DENABLE_SDL2=ON \
+            -DSDL_UNIX_CONSOLE_BUILD=ON \
+            -DSDL_KMSDRM=ON \
+            -DSDL_ALSA=ON \
             -DYUZU_USE_QT_MULTIMEDIA=OFF \
             -DYUZU_USE_EXTERNAL_SDL2=OFF \
             -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF \
@@ -44,7 +71,8 @@ jobs:
 
       - name: Compile CLI Target
         run: |
-          ninja -C build eden-cmd || ninja -C build yuzu-cmd
+          # 限制并发线程为 2，防止内存溢出 (OOM) 导致编译器被系统杀掉
+          ninja -C build -j 2 eden-cmd || ninja -C build -j 2 yuzu-cmd
 
       - name: Package & Upload Artifact
         uses: actions/upload-artifact@v4
