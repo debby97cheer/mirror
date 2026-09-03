@@ -1,0 +1,55 @@
+name: Build Eden-CMD ARM64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-aarch64:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Toolchain & Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            pkg-config
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DENABLE_QT=OFF \
+            -DENABLE_SDL2=ON \
+            -DYUZU_USE_QT_MULTIMEDIA=OFF \
+            -DYUZU_USE_EXTERNAL_SDL2=OFF \
+            -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF \
+            -DYUZU_ENABLE_COMPATIBILITY_REPORTING=OFF \
+            -DENABLE_FFMPEG=ON \
+            -DYUZU_USE_BUNDLED_FFMPEG=ON \
+            -DYUZU_TESTS=OFF
+
+      - name: Compile CLI Target
+        run: |
+          ninja -C build eden-cmd || ninja -C build yuzu-cmd
+
+      - name: Package & Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-cmd-aarch64
+          path: |
+            build/bin/eden-cmd
+            build/bin/yuzu-cmd
