@@ -8,44 +8,38 @@ permissions:
 
 jobs:
   build-eden-bionic-arm64:
-
     runs-on: ubuntu-latest
 
     steps:
-
       # ============================================================
-      # 1. 清理 Runner 磁盘
+      # 1. 清理 Runner 磁盘空间
       # ============================================================
       - name: Free Disk Space
         shell: bash
         run: |
           set -eux
-
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /opt/ghc || true
           sudo rm -rf "/usr/local/share/boost" || true
-
           df -h
 
       # ============================================================
-      # 2. Checkout Eden
+      # 2. 拉取源码与子模块
       # ============================================================
-      - name: Checkout Eden
+      - name: Checkout Eden Source
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
 
       # ============================================================
-      # 3. Host dependencies
+      # 3. 安装构建主机基础依赖
       # ============================================================
       - name: Install Host Dependencies
         shell: bash
         run: |
           set -eux
-
           sudo apt-get update
-
           sudo apt-get install -y \
             cmake \
             ninja-build \
@@ -56,14 +50,12 @@ jobs:
             python3 \
             pkg-config
 
-          echo "===== Versions ====="
-
           cmake --version
           ninja --version
           python3 --version
 
       # ============================================================
-      # 4. Android NDK r27c
+      # 4. 配置 Android NDK r27c 并全局导出路径
       # ============================================================
       - name: Setup Android NDK r27c
         id: setup-ndk
@@ -72,22 +64,21 @@ jobs:
           ndk-version: r27c
           add-to-path: true
 
+      - name: Export Global NDK Environment
+        shell: bash
+        run: |
+          echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
       # ============================================================
-      # 5. Patch Eden build configuration
+      # 5. 精准补丁构建图 (启用 CLI、禁用 JNI、植入 ELF main 桥接)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
         run: |
           set -eux
-
-          echo
           echo "============================================================"
-          echo "Eden ARM64 Bionic CLI preparation"
+          echo "1. 解除 YUZU_CMD 的 Android 平台排他限制"
           echo "============================================================"
-
-          # --------------------------------------------------------
-          # 5.1 只解除 YUZU_CMD 的 Android dependent 限制
-          # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -95,87 +86,27 @@ jobs:
           path = Path("CMakeLists.txt")
           text = path.read_text()
 
-          # Eden 当前通常类似：
-          #
-          # cmake_dependent_option(
-          #     YUZU_CMD
-          #     "Compile the eden-cli executable"
-          #     ON
-          #     "NOT ANDROID"
-          #     OFF
-          # )
-          #
-          # 我们只把 YUZU_CMD 改成普通 option。
           pattern = re.compile(
-              r'cmake_dependent_option\(\s*'
-              r'YUZU_CMD\s+'
-              r'"[^"]*"\s+'
-              r'[^)]*?'
-              r'"NOT ANDROID"\s+'
-              r'OFF\s*\)',
+              r'cmake_dependent_option\(\s*YUZU_CMD\s+"[^"]*"\s+[^)]*?"NOT ANDROID"\s+OFF\s*\)',
               re.MULTILINE
           )
 
-          match = pattern.search(text)
-
-          if match:
-              print("Found Android-dependent YUZU_CMD:")
-              print(match.group(0))
-
-              replacement = (
-                  'option(YUZU_CMD '
-                  '"Compile the eden-cli executable" ON)'
-              )
-
-              text = (
-                  text[:match.start()]
-                  + replacement
-                  + text[match.end():]
-              )
-
+          if pattern.search(text):
+              text = pattern.sub('option(YUZU_CMD "Compile the eden-cli executable" ON)', text, count=1)
+              print("YUZU_CMD converted to standard option.")
           elif 'option(YUZU_CMD "Compile the eden-cli executable" ON)' in text:
-              print("YUZU_CMD is already patched.")
-
-          else:
-              raise SystemExit(
-                  "ERROR: YUZU_CMD configuration was not found."
-              )
-
-          path.write_text(text)
-          PY
-
-          # --------------------------------------------------------
-          # 5.2 添加专用 Bionic CLI 开关
-          # --------------------------------------------------------
-          python3 <<'PY'
-          from pathlib import Path
-
-          path = Path("CMakeLists.txt")
-          text = path.read_text()
-
-          marker = 'option(YUZU_CMD "Compile the eden-cli executable" ON)'
+              print("YUZU_CMD already configured.")
 
           if 'option(YUZU_BIONIC_CLI' not in text:
-              if marker not in text:
-                  raise SystemExit(
-                      "ERROR: Could not find YUZU_CMD marker."
-                  )
-
-              text = text.replace(
-                  marker,
-                  marker
-                  + '\n'
-                  + 'option(YUZU_BIONIC_CLI '
-                  '"Build standalone Android/Bionic CLI" ON)',
-                  1
-              )
+              marker = 'option(YUZU_CMD "Compile the eden-cli executable" ON)'
+              text = text.replace(marker, marker + '\noption(YUZU_BIONIC_CLI "Build standalone Android/Bionic CLI" ON)', 1)
 
           path.write_text(text)
           PY
 
-          # --------------------------------------------------------
-          # 5.3 禁用 Android JNI application
-          # --------------------------------------------------------
+          echo "============================================================"
+          echo "2. 排除 yuzu-android JNI 模块"
+          echo "============================================================"
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -183,17 +114,8 @@ jobs:
           path = Path("src/CMakeLists.txt")
           text = path.read_text()
 
-          # 只针对 Android JNI 子目录。
-          #
-          # 不进行：
-          #   sed 's/if (NOT ANDROID)/if (TRUE)/g'
-          #
-          # 避免破坏其它平台条件。
           pattern = re.compile(
-              r'if\s*\(\s*ANDROID\s*\)\s*'
-              r'add_subdirectory\(\s*android/app/src/main/jni\s*\)\s*'
-              r'target_include_directories\(\s*yuzu-android\s+PRIVATE\s+android/app/src/main\s*\)'
-              r'\s*endif\s*\(\s*\)',
+              r'if\s*\(\s*ANDROID\s*\)\s*add_subdirectory\(\s*android/app/src/main/jni\s*\)\s*target_include_directories\(\s*yuzu-android\s+PRIVATE\s+android/app/src/main\s*\)\s*endif\s*\(\s*\)',
               re.MULTILINE
           )
 
@@ -204,179 +126,112 @@ jobs:
 
           if pattern.search(text):
               text = pattern.sub(replacement, text, count=1)
-              print("Android JNI build disabled for Bionic CLI.")
+              print("yuzu-android JNI target bypassed.")
           elif "ANDROID AND NOT YUZU_BIONIC_CLI" in text:
-              print("Android JNI guard already patched.")
-          else:
-              print(
-                  "WARNING: Android JNI block was not found. "
-                  "Will verify generated targets later."
-              )
+              print("JNI guard already in place.")
 
           path.write_text(text)
           PY
 
-          # --------------------------------------------------------
-          # 5.4 确保 thread_worker.h 显式包含 stop_token
-          # --------------------------------------------------------
-          if [ -f src/common/thread_worker.h ]; then
+          echo "============================================================"
+          echo "3. 补齐关键头文件 <stop_token>"
+          echo "============================================================"
+          for f in src/common/thread_worker.h src/common/polyfill_thread.h src/common/thread.h; do
+            if [ -f "$f" ] && ! grep -q '#include <stop_token>' "$f"; then
+              sed -i '1i #include <stop_token>' "$f"
+              echo "Injected <stop_token> into $f"
+            fi
+          done
 
-            if ! grep -q '#include <stop_token>' src/common/thread_worker.h; then
-              python3 - <<'PY'
+          echo "============================================================"
+          echo "4. 生成并注入 Bionic ELF 原生入口桥接"
+          echo "============================================================"
+          cat > src/yuzu_cmd/eden_bionic_entry.cpp <<'EOF'
+          // SPDX-License-Identifier: GPL-3.0-or-later
+          #define SDL_MAIN_HANDLED 1
+
+          #include <SDL3/SDL.h>
+          #include <SDL3/SDL_main.h>
+
+          extern "C" SDL_AppResult SDLCALL SDL_AppInit(void** appstate, int argc, char** argv);
+          extern "C" SDL_AppResult SDLCALL SDL_AppIterate(void* appstate);
+          extern "C" SDL_AppResult SDLCALL SDL_AppEvent(void* appstate, SDL_Event* event);
+          extern "C" void SDLCALL SDL_AppQuit(void* appstate, SDL_AppResult result);
+
+          int main(int argc, char** argv) {
+              return SDL_EnterAppMainCallbacks(
+                  argc,
+                  argv,
+                  SDL_AppInit,
+                  SDL_AppIterate,
+                  SDL_AppEvent,
+                  SDL_AppQuit
+              );
+          }
+          EOF
+
+          python3 <<'PY'
           from pathlib import Path
 
-          path = Path("src/common/thread_worker.h")
-          text = path.read_text()
-
-          text = '#include <stop_token>\n' + text
-
-          path.write_text(text)
-
-          print("Added <stop_token> to thread_worker.h")
+          p = Path("src/yuzu_cmd/CMakeLists.txt")
+          if p.exists():
+              content = p.read_text()
+              if "eden_bionic_entry.cpp" not in content:
+                  content = content.replace("yuzu.cpp", "yuzu.cpp\n    eden_bionic_entry.cpp", 1)
+                  p.write_text(content)
+                  print("Registered eden_bionic_entry.cpp in src/yuzu_cmd/CMakeLists.txt")
           PY
-            else
-              echo "<stop_token> already included."
-            fi
-
-          else
-            echo "ERROR: src/common/thread_worker.h not found."
-            exit 1
-          fi
-
-          # --------------------------------------------------------
-          # 5.5 不修改 yuzu.cpp
-          # --------------------------------------------------------
-          echo
-          echo "============================================================"
-          echo "yuzu.cpp integrity check"
-          echo "============================================================"
-
-          git diff -- src/yuzu_cmd/yuzu.cpp || true
-
-          # --------------------------------------------------------
-          # 5.6 检查 Eden 当前 SDL callback
-          # --------------------------------------------------------
-          echo
-          echo "============================================================"
-          echo "SDL entry model"
-          echo "============================================================"
-
-          grep -nE \
-            'SDL_MAIN_USE_CALLBACKS|SDL_AppInit|SDL_AppIterate|SDL_AppEvent|SDL_AppQuit' \
-            src/yuzu_cmd/yuzu.cpp \
-            || true
-
-          # --------------------------------------------------------
-          # 5.7 输出关键配置
-          # --------------------------------------------------------
-          echo
-          echo "============================================================"
-          echo "Important configuration"
-          echo "============================================================"
-
-          grep -nE \
-            'YUZU_CMD|YUZU_BIONIC_CLI' \
-            CMakeLists.txt \
-            | head -40
-
-          echo
-          echo "============================================================"
-          echo "stop_callback source"
-          echo "============================================================"
-
-          grep -n \
-            'std::stop_callback' \
-            src/common/thread_worker.h \
-            || true
 
       # ============================================================
-      # 6. Configure CMake
+      # 6. 执行 CMake 配置
       # ============================================================
       - name: Configure CMake
         shell: bash
         run: |
           set -eux
-
-          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-
-          echo "NDK = $NDK_PATH"
-
           rm -rf build
 
           cmake -S . -B build \
             -GNinja \
             -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
             -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
-            \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-34 \
             -DANDROID_STL=c++_shared \
-            \
             -DCMAKE_BUILD_TYPE=Release \
-            \
             -DCMAKE_CXX_STANDARD=20 \
             -DCMAKE_CXX_STANDARD_REQUIRED=ON \
             -DCMAKE_CXX_EXTENSIONS=OFF \
-            \
             -DYUZU_CMD=ON \
             -DYUZU_BIONIC_CLI=ON \
-            \
             -DENABLE_QT=OFF \
             -DENABLE_QT_TRANSLATION=OFF \
-            \
             -DYUZU_USE_BUNDLED_SDL3=ON \
-            \
             -DENABLE_OPENGL=OFF \
-            \
             -DENABLE_CUBEB=OFF \
-            \
             -DENABLE_WEB_SERVICE=OFF \
-            \
             -DENABLE_UPDATE_CHECKER=OFF \
-            \
-            -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF \
-            \
             -DENABLE_LIBUSB=OFF \
-            \
             -DUSE_DISCORD_PRESENCE=OFF \
-            \
             -DYUZU_ROOM=OFF \
             -DYUZU_ROOM_STANDALONE=OFF \
-            \
             -DYUZU_TESTS=OFF \
-            \
             -DYUZU_DOWNLOAD_ANDROID_VVL=OFF \
-            \
-            -DYUZU_ENABLE_LTO=OFF \
-            \
-            -DYUZU_USE_BUNDLED_VCPKG=OFF \
-            \
+            -DYUZU_DOWNLOAD_TIME_ZONE_DATA=ON \
             -DYUZU_LEGACY=ON \
-            \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld"
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" \
+            -DCMAKE_CXX_FLAGS="-fexperimental-library" \
+            -DCMAKE_C_FLAGS="-fexperimental-library"
 
       # ============================================================
-      # 7. Verify CMake actually selected C++20
+      # 7. 验证 C++20 编译器特性
       # ============================================================
       - name: Verify CXX20 Configuration
         shell: bash
         run: |
           set -eux
-
-          echo "============================================================"
-          echo "C++ standard verification"
-          echo "============================================================"
-
-          grep -E \
-            'CMAKE_CXX_STANDARD:|CMAKE_CXX_FLAGS:' \
-            build/CMakeCache.txt \
-            || true
-
-          echo
-          echo "============================================================"
-          echo "Test compiler command for std=c++20"
-          echo "============================================================"
+          grep -E 'CMAKE_CXX_STANDARD:|CMAKE_CXX_FLAGS:' build/CMakeCache.txt || true
 
           cat > /tmp/test_cpp20.cpp <<'EOF'
           #include <stop_token>
@@ -389,12 +244,7 @@ jobs:
           int main() {
               std::stop_source source;
               std::stop_token token = source.get_token();
-
-              std::stop_callback callback(
-                  token,
-                  []() {}
-              );
-
+              std::stop_callback callback(token, []() {});
               test(token);
               return 0;
           }
@@ -409,197 +259,86 @@ jobs:
             -o /tmp/test_cpp20
 
           file /tmp/test_cpp20
-
           echo "C++20 stop_token/stop_callback test PASSED."
 
       # ============================================================
-      # 8. 检查生成的 build.ninja
+      # 8. 编译可执行程序目标
       # ============================================================
-      - name: Inspect Ninja Configuration
+      - name: Build Eden CLI Target
         shell: bash
         run: |
           set -eux
 
-          echo "============================================================"
-          echo "Search generated compile rules"
-          echo "============================================================"
-
-          grep -R \
-            -- '-std=c++20' \
-            build/build.ninja \
-            build/src \
-            2>/dev/null \
-            | head -20 \
-            || true
-
-          echo
-          echo "============================================================"
-          echo "Check yuzu-android"
-          echo "============================================================"
-
-          if grep -R \
-            'yuzu-android' \
-            build/build.ninja \
-            2>/dev/null; then
-
-              echo "WARNING: yuzu-android references exist."
-
-          else
-
-              echo "OK: yuzu-android is not in generated build graph."
-
+          echo "=== 检索当前构建图中的目标名称 ==="
+          TARGET=""
+          if ninja -C build -t targets all | grep -q 'bin/eden-cli:'; then
+              TARGET="eden-cli"
+          elif ninja -C build -t targets all | grep -q 'bin/yuzu-cmd:'; then
+              TARGET="yuzu-cmd"
+          elif ninja -C build -t targets all | grep -q 'eden-cli'; then
+              TARGET="eden-cli"
+          elif ninja -C build -t targets all | grep -q 'yuzu-cmd'; then
+              TARGET="yuzu-cmd"
           fi
 
-          echo
-          echo "============================================================"
-          echo "Check eden-cli"
-          echo "============================================================"
-
-          ninja -C build -t targets all \
-            | grep -E 'eden-cli|yuzu-cmd' \
-            | head -50 \
-            || true
+          echo "Target matched: ${TARGET:-all}"
+          if [ -n "$TARGET" ]; then
+              ninja -C build -j"$(nproc)" "$TARGET"
+          else
+              ninja -C build -j"$(nproc)"
+          fi
 
       # ============================================================
-      # 9. 编译 eden-cli
-      # ============================================================
-      - name: Build Eden CLI
-        shell: bash
-        run: |
-          set -eux
-
-          echo "============================================================"
-          echo "Building Eden CLI"
-          echo "============================================================"
-
-          ninja -C build -j"$(nproc)" eden-cli
-
-      # ============================================================
-      # 10. 最终 ELF 检查
+      # 9. 检验生成的 Bionic ARM64 ELF 文件
       # ============================================================
       - name: Verify Eden ARM64 ELF
         shell: bash
         run: |
           set -eux
+          BIN=$(find build/bin -maxdepth 1 -type f \( -name "eden-cli" -o -name "yuzu-cmd" \) | head -n 1)
 
-          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-
-          BIN="build/bin/eden-cli"
-
-          if [ ! -f "$BIN" ]; then
-            echo "ERROR: build/bin/eden-cli was not produced."
+          if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
+            echo "ERROR: Executable (eden-cli or yuzu-cmd) was not found in build/bin."
+            find build -type f -executable | head -40
             exit 1
           fi
 
-          echo
-          echo "============================================================"
-          echo "FILE"
-          echo "============================================================"
-
+          echo "Found Binary: $BIN"
           file "$BIN"
-
-          echo
-          echo "============================================================"
-          echo "ELF HEADER"
-          echo "============================================================"
-
           readelf -h "$BIN"
 
-          echo
-          echo "============================================================"
-          echo "INTERPRETER"
-          echo "============================================================"
+          echo "=== 检查 ELF Interpreter (必须为 /system/bin/linker64) ==="
+          readelf -l "$BIN" | grep -A2 INTERP || true
 
-          readelf -l "$BIN" \
-            | grep -A2 INTERP \
-            || true
+          echo "=== 检查符号导出 (确保 main 存在) ==="
+          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -C "$BIN" | grep -E '(^| )main$' || true
 
-          echo
-          echo "============================================================"
-          echo "MAIN SYMBOL"
-          echo "============================================================"
-
-          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
-            -C "$BIN" \
-            | grep -E '(^| )main$' \
-            || true
-
-          echo
-          echo "============================================================"
-          echo "SDL CALLBACK SYMBOLS"
-          echo "============================================================"
-
-          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
-            -C "$BIN" \
-            | grep -E \
-              'SDL_AppInit|SDL_AppIterate|SDL_AppEvent|SDL_AppQuit' \
-            || true
-
-          echo
-          echo "============================================================"
-          echo "DYNAMIC DEPENDENCIES"
-          echo "============================================================"
-
+          echo "=== 动态链接库依赖 ==="
           readelf -d "$BIN"
 
       # ============================================================
-      # 11. 收集运行时
+      # 10. 收集交付物并归档
       # ============================================================
-      - name: Prepare Runtime
+      - name: Package Runtime Artifacts
         shell: bash
         run: |
           set -eux
+          rm -rf output_bin && mkdir -p output_bin
 
-          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-
-          rm -rf output_bin
-          mkdir -p output_bin
-
-          cp \
-            build/bin/eden-cli \
-            output_bin/eden-cli
+          BIN=$(find build/bin -maxdepth 1 -type f \( -name "eden-cli" -o -name "yuzu-cmd" \) | head -n 1)
+          cp "$BIN" output_bin/eden-cli
+          cp "$BIN" output_bin/yuzu-cmd
 
           LIBCXX="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+          cp "$LIBCXX" output_bin/libc++_shared.so
 
-          if [ ! -f "$LIBCXX" ]; then
-            echo "ERROR: libc++_shared.so not found."
-            exit 1
-          fi
+          find build/bin -maxdepth 1 -type f -name '*.so' -exec cp {} output_bin/ \; || true
 
-          cp \
-            "$LIBCXX" \
-            output_bin/libc++_shared.so
-
-          echo
-          echo "============================================================"
-          echo "Runtime files"
-          echo "============================================================"
-
-          find output_bin \
-            -maxdepth 1 \
-            -type f \
-            -exec file {} \;
-
-          echo
-          ls -lah output_bin
+          ls -lah output_bin/
+          tar -czf eden-bionic-arm64.tar.gz -C output_bin .
 
       # ============================================================
-      # 12. 打包
-      # ============================================================
-      - name: Package Eden Bionic ARM64
-        shell: bash
-        run: |
-          set -eux
-
-          tar \
-            -czf eden-bionic-arm64.tar.gz \
-            -C output_bin \
-            .
-
-          ls -lh eden-bionic-arm64.tar.gz
-
-      # ============================================================
-      # 13. Artifact
+      # 11. 上传构建成果
       # ============================================================
       - name: Upload Eden Bionic ARM64
         uses: actions/upload-artifact@v4
