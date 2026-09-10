@@ -74,7 +74,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (严格单行字符串对齐，杜绝 YAML 缩进错误)
+      # 5. 精确源码重构 (纯无头 EmuWindow + 进程遥测)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -253,7 +253,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 改造 emu_window_sdl3.cpp 为纯无头模式 (安全字符串替换)
+          # 5.8 改造 emu_window_sdl3.cpp 为纯无头模式 (移除未定义调用)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -274,7 +274,6 @@ jobs:
               "    std::cout << \"[BIONIC] EmuWindow_SDL3: Headless CLI mode - bypassing physical SDL window & SurfaceFlinger\" << std::endl;\n"
               "    is_open = true;\n"
               "    render_window = nullptr;\n"
-              "    NotifyScreenLayoutChanged(Layout::DefaultFrameLayout(1280, 720));\n"
               "    return;\n"
               "#endif\n"
           )
