@@ -50,10 +50,6 @@ jobs:
             python3 \
             pkg-config
 
-          cmake --version
-          ninja --version
-          python3 --version
-
       # ============================================================
       # 4. 配置 Android NDK r27c 并全局导出路径
       # ============================================================
@@ -70,15 +66,13 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精准补丁构建图 (注入缺失系统库、实体定义与 ELF main)
+      # 5. 精准补丁 (注入 OpenSLES 空桩，根除动态库依赖)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
         run: |
           set -eux
-          echo "============================================================"
-          echo "1. 解除 YUZU_CMD 的 Android 限制"
-          echo "============================================================"
+          echo "=== 1. 解除 YUZU_CMD 的 Android 平台限制 ==="
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -93,9 +87,6 @@ jobs:
 
           if pattern.search(text):
               text = pattern.sub('option(YUZU_CMD "Compile the eden-cli executable" ON)', text, count=1)
-          elif 'option(YUZU_CMD "Compile the eden-cli executable" ON)' not in text:
-              print("Warning: YUZU_CMD pattern not matched directly.")
-
           if 'option(YUZU_BIONIC_CLI' not in text:
               marker = 'option(YUZU_CMD "Compile the eden-cli executable" ON)'
               if marker in text:
@@ -104,9 +95,7 @@ jobs:
           path.write_text(text)
           PY
 
-          echo "============================================================"
-          echo "2. 排除 yuzu-android JNI 模块"
-          echo "============================================================"
+          echo "=== 2. 排除 yuzu-android JNI 模块 ==="
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -129,18 +118,14 @@ jobs:
           path.write_text(text)
           PY
 
-          echo "============================================================"
-          echo "3. 补齐 <stop_token> 头文件"
-          echo "============================================================"
+          echo "=== 3. 补齐 <stop_token> ==="
           for f in src/common/thread_worker.h src/common/polyfill_thread.h src/common/thread.h; do
             if [ -f "$f" ] && ! grep -q '#include <stop_token>' "$f"; then
               sed -i '1i #include <stop_token>' "$f"
             fi
           done
 
-          echo "============================================================"
-          echo "4. 生成包含 Android 全局状态的 Bionic 入口包装层"
-          echo "============================================================"
+          echo "=== 4. 生成包含 OpenSLES 独立桩与实体的入口文件 ==="
           cat > src/yuzu_cmd/eden_bionic_entry.cpp <<'EOF'
           // SPDX-License-Identifier: GPL-3.0-or-later
           #define SDL_MAIN_HANDLED 1
@@ -148,8 +133,8 @@ jobs:
           #include <SDL3/SDL.h>
           #include <SDL3/SDL_main.h>
           #include <atomic>
+          #include <cstdint>
 
-          // 引入 Android 模式下 video_core 与 settings 所需的实体实例
           #include "common/settings.h"
 
           #ifdef __ANDROID__
@@ -157,10 +142,25 @@ jobs:
           Settings::Values values{};
           }
 
-          // 补充 common/device_power_state.cpp 依赖的全局电池状态
           std::atomic<int> g_battery_percentage{100};
           std::atomic<bool> g_is_charging{false};
           std::atomic<bool> g_has_battery{true};
+
+          // ====================================================================
+          // 裸机 OpenSLES 空桩 (消除对系统 libOpenSLES.so 的动态依赖)
+          // ====================================================================
+          extern "C" {
+          const uint8_t SL_IID_ENGINE[16] = {0};
+          const uint8_t SL_IID_VOLUME[16] = {0};
+          const uint8_t SL_IID_ANDROIDSIMPLEBUFFERQUEUE[16] = {0};
+          const uint8_t SL_IID_RECORD[16] = {0};
+          const uint8_t SL_IID_PLAY[16] = {0};
+
+          // 返回非 0 告知 SDL3 音频后端初始化不启用 OpenSLES，安全跳过
+          int slCreateEngine(void*, int, const void*, int, const void*, const void*) {
+              return 1;
+          }
+          }
           #endif
 
           extern "C" SDL_AppResult SDLCALL SDL_AppInit(void** appstate, int argc, char** argv);
@@ -188,15 +188,14 @@ jobs:
               content = p.read_text()
               if "eden_bionic_entry.cpp" not in content:
                   content = content.replace("yuzu.cpp", "yuzu.cpp\n    eden_bionic_entry.cpp", 1)
-              # 显式链接缺失的 NDK 系统日志与音频库
-              if "target_link_libraries(yuzu-cmd PRIVATE log OpenSLES)" not in content:
-                  content += "\ntarget_link_libraries(yuzu-cmd PRIVATE log OpenSLES)\n"
+              # 仅链接必要的系统基础日志库，彻底移除 OpenSLES
+              if "target_link_libraries(yuzu-cmd PRIVATE log)" not in content:
+                  content += "\ntarget_link_libraries(yuzu-cmd PRIVATE log)\n"
               p.write_text(content)
-              print("Updated src/yuzu_cmd/CMakeLists.txt with entry and libraries.")
           PY
 
       # ============================================================
-      # 6. 执行 CMake 配置 (附加 -llog 与 -lOpenSLES 链接选项)
+      # 6. 执行 CMake 配置 (完全剥离 -lOpenSLES)
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -232,19 +231,18 @@ jobs:
             -DYUZU_DOWNLOAD_ANDROID_VVL=OFF \
             -DYUZU_DOWNLOAD_TIME_ZONE_DATA=ON \
             -DYUZU_LEGACY=ON \
-            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -llog -lOpenSLES" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -llog" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" \
             -DCMAKE_CXX_FLAGS="-fexperimental-library" \
             -DCMAKE_C_FLAGS="-fexperimental-library"
 
       # ============================================================
-      # 7. 编译目标可执行程序
+      # 7. 编译目标
       # ============================================================
       - name: Build Eden CLI Target
         shell: bash
         run: |
           set -eux
-
           TARGET=""
           if ninja -C build -t targets all | grep -q 'bin/eden-cli:'; then
               TARGET="eden-cli"
@@ -256,7 +254,6 @@ jobs:
               TARGET="yuzu-cmd"
           fi
 
-          echo "Target matched: ${TARGET:-all}"
           if [ -n "$TARGET" ]; then
               ninja -C build -j"$(nproc)" "$TARGET"
           else
@@ -264,38 +261,26 @@ jobs:
           fi
 
       # ============================================================
-      # 8. 校验生成的 Bionic ARM64 ELF 文件
+      # 8. 校验 ELF 动态依赖 (必须确认不存在 libOpenSLES.so)
       # ============================================================
       - name: Verify Eden ARM64 ELF
         shell: bash
         run: |
           set -eux
-
           BIN=$(find build/bin -maxdepth 1 -type f \( -name "eden-cli" -o -name "yuzu-cmd" \) | head -n 1)
 
-          if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
-            echo "ERROR: Executable was not found in build/bin."
-            find build -type f -executable | head -40
-            exit 1
-          fi
-
-          echo "============================================================"
-          echo "Found Binary: $BIN"
-          echo "============================================================"
-          file "$BIN"
-          readelf -h "$BIN"
-
-          echo "=== 检查 ELF Interpreter (确认 Bionic 动态加载器) ==="
-          readelf -l "$BIN" | grep -A2 INTERP || true
-
-          echo "=== 检查 main 入口符号导出 ==="
-          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -C "$BIN" | grep -E '(^| )main$' || true
-
-          echo "=== 动态链接依赖库列表 ==="
+          echo "=== 检查动态链接依赖项 ==="
           readelf -d "$BIN"
 
+          # 强制断言：若仍存在 OpenSLES 依赖则中断
+          if readelf -d "$BIN" | grep -i opensles; then
+            echo "ERROR: libOpenSLES.so dependency still present!"
+            exit 1
+          fi
+          echo "PASS: Binary is 100% free from libOpenSLES.so"
+
       # ============================================================
-      # 9. 提取交付物并归档
+      # 9. 打包交付物
       # ============================================================
       - name: Package Runtime Artifacts
         shell: bash
@@ -310,9 +295,6 @@ jobs:
           LIBCXX="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
           cp "$LIBCXX" output_bin/libc++_shared.so
 
-          find build/bin -maxdepth 1 -type f -name '*.so' -exec cp {} output_bin/ \; || true
-
-          ls -lah output_bin/
           tar -czf eden-bionic-arm64.tar.gz -C output_bin .
 
       # ============================================================
