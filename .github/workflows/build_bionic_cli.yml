@@ -66,7 +66,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精准手术：单点重构 yuzu.cpp (原生 main + 纯净 Bionic 前端)
+      # 5. 精准手术：重构 yuzu.cpp 并注入宏定义与原生 main 入口
       # ============================================================
       - name: Patch Eden Core and Yuzu CMD
         shell: bash
@@ -124,28 +124,29 @@ jobs:
             fi
           done
 
-          echo "=== 4. 确保 yuzu_cmd/CMakeLists.txt 纯净链接 ==="
+          echo "=== 4. 向 yuzu_cmd 显式注入编译宏与链接规则 ==="
           python3 <<'PY'
           from pathlib import Path
 
           p = Path("src/yuzu_cmd/CMakeLists.txt")
           content = p.read_text()
+          if "target_compile_definitions(yuzu-cmd PRIVATE YUZU_BIONIC_CLI)" not in content:
+              content += "\ntarget_compile_definitions(yuzu-cmd PRIVATE YUZU_BIONIC_CLI)\n"
           if "target_link_libraries(yuzu-cmd PRIVATE log)" not in content:
               content += "\ntarget_link_libraries(yuzu-cmd PRIVATE log)\n"
           p.write_text(content)
           PY
 
-          echo "=== 5. 重构 yuzu.cpp：原生生命周期 + 闭环符号 + NullRender 短参数 ==="
+          echo "=== 5. 重构 yuzu.cpp：原生生命周期 + 闭环符号 + 稳固 main ==="
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("src/yuzu_cmd/yuzu.cpp")
           text = path.read_text()
 
-          # 5.1 顶部宏与头文件替换
-          old_header = "#define SDL_MAIN_USE_CALLBACKS\n#include <SDL3/SDL_main.h>"
-          new_header = """#ifdef YUZU_BIONIC_CLI
-          #define SDL_MAIN_HANDLED
+          # 5.1 顶部替换：无条件以 SDL_MAIN_HANDLED 接管，杜绝 SDL 冲突
+          header_replacement = """#define SDL_MAIN_HANDLED
           #include <SDL3/SDL.h>
           #include <SDL3/SDL_main.h>
           #include <unistd.h>
@@ -163,7 +164,7 @@ jobs:
           std::atomic<bool> g_is_charging{false};
           std::atomic<bool> g_has_battery{true};
 
-          // 仅用于满足预编译 libSDL3.a 内部未引用的死代码符号，不依赖外部动态库
+          // 仅用于就地满足预编译 libSDL3.a 内部死代码对 NDK 的外部引用
           extern "C" {
           struct SLInterfaceID_ { uint32_t a; uint16_t b, c, d; uint8_t e[6]; };
           static const struct SLInterfaceID_ s_dummy = {0, 0, 0, 0, {0}};
@@ -211,43 +212,36 @@ jobs:
           void AAsset_close(void*) {}
           }
           #endif
-          #else
-          #define SDL_MAIN_USE_CALLBACKS
-          #include <SDL3/SDL_main.h>
-          #endif"""
+          """
 
-          if old_header in text:
-              text = text.replace(old_header, new_header, 1)
+          text = re.sub(
+              r'#define\s+SDL_MAIN_USE_CALLBACKS\s*\n\s*#include\s+<SDL3/SDL_main\.h>',
+              header_replacement,
+              text,
+              count=1
+          )
 
-          # 5.2 修复短参数 optstring (加入 'n')
-          text = text.replace('"g:p:fvh"', '"g:p:fvhn"')
-          text = text.replace('"g:p:f:vh"', '"g:p:f:vhn"')
+          # 5.2 确保 optstring 支持短参数 'n'
+          text = re.sub(r'getopt_long\(([^,]+,[^,]+,)"([^"]*)"', lambda m: f'getopt_long({m.group(1)}"{m.group(2) if "n" in m.group(2) else m.group(2) + "n"}"', text)
 
-          # 5.3 修正 SDL_AppInit 成功返回值为 SDL_APP_CONTINUE
-          old_init_return = "void(state->system.Run());"
-          new_init_return = """void(state->system.Run());
-          #ifdef YUZU_BIONIC_CLI
-              return SDL_APP_CONTINUE;
-          #endif"""
-          if old_init_return in text and "#ifdef YUZU_BIONIC_CLI" not in text:
-              text = text.replace(old_init_return, new_init_return, 1)
+          # 5.3 修正 SDL_AppInit 成功时的返回值为 SDL_APP_CONTINUE
+          text = re.sub(r'void\s*\(\s*state->system\.Run\(\)\s*\)\s*;', 'void(state->system.Run());\n    return SDL_APP_CONTINUE;', text, count=1)
 
-          # 5.4 尾部追加 Bionic 专有的自主控制主循环
+          # 5.4 尾部注入原生 main() 入口函数
           bionic_main = """
-          #ifdef YUZU_BIONIC_CLI
-          int main(int argc, char** argv) {
+          extern "C" int main(int argc, char** argv) {
               if (chdir("/data/eden") != 0) {
-                  // 尝试切入工作目录，若失败则继续执行
+                  // 工作目录容错
               }
 
-              // 明确通知 SDL3 主入口已就绪
+              // 明确告知 SDL3 库主入口已由原生层接管
               SDL_SetMainReady();
 
               void* appstate = nullptr;
               SDL_AppResult result = SDL_AppInit(&appstate, argc, argv);
 
               if (result != SDL_APP_CONTINUE) {
-                  if (appstate) {
+                  if (appstate != nullptr) {
                       SDL_AppQuit(appstate, result);
                   }
                   return (result == SDL_APP_SUCCESS) ? 0 : 1;
@@ -267,22 +261,23 @@ jobs:
                   result = SDL_AppIterate(appstate);
               }
 
-              if (appstate) {
+              if (appstate != nullptr) {
                   SDL_AppQuit(appstate, result);
               }
               return (result == SDL_APP_SUCCESS) ? 0 : 1;
           }
-          #endif
           """
-          if "int main(" not in text:
+          if "extern \"C\" int main(" not in text:
               text += bionic_main
 
+          # 严格断言：确保 main 已经被正确写入源码
+          assert "extern \"C\" int main(" in text, "CRITICAL ERROR: Failed to patch main() into yuzu.cpp!"
           path.write_text(text)
-          print("yuzu.cpp successfully patched with Native Bionic Main!")
+          print("SUCCESS: yuzu.cpp has been verified and patched with main()!")
           PY
 
       # ============================================================
-      # 6. 配置 CMake
+      # 6. 配置 CMake (传递 -DYUZU_BIONIC_CLI 预编译宏)
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -320,8 +315,8 @@ jobs:
             -DYUZU_LEGACY=ON \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -llog" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" \
-            -DCMAKE_CXX_FLAGS="-fexperimental-library" \
-            -DCMAKE_C_FLAGS="-fexperimental-library"
+            -DCMAKE_CXX_FLAGS="-fexperimental-library -DYUZU_BIONIC_CLI" \
+            -DCMAKE_C_FLAGS="-fexperimental-library -DYUZU_BIONIC_CLI"
 
       # ============================================================
       # 7. 从 Ninja 链接规则中剥离外部框架库
@@ -360,7 +355,7 @@ jobs:
           fi
 
       # ============================================================
-      # 9. 校验依赖纯净度
+      # 9. 校验依赖纯净度与导出符号
       # ============================================================
       - name: Verify Clean Bionic ELF
         shell: bash
