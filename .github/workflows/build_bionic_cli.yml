@@ -1,7 +1,7 @@
 name: Build Eden Bionic Native CLI (ARM64)
 
 on:
-  workflow_dispatch: # 支持网页端一键手动触发
+  workflow_dispatch:
 
 jobs:
   build-android-bionic:
@@ -11,7 +11,6 @@ jobs:
       - name: Free Disk Space
         run: |
           sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android/sdk/ndk/*
           sudo rm -rf /opt/ghc
           sudo rm -rf "/usr/local/share/boost"
           df -h
@@ -28,6 +27,7 @@ jobs:
           sudo apt-get install -y cmake ninja-build ccache glslang-tools nasm
 
       - name: Setup Android NDK
+        id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26b
@@ -36,16 +36,19 @@ jobs:
       - name: Patch CMake for Bionic CLI Build
         run: |
           echo "[*] 解除 yuzu_cmd 的 NOT ANDROID 限制..."
-          # 允许在 Android 环境下构建 yuzu_cmd 目标
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' CMakeLists.txt || true
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' src/CMakeLists.txt || true
 
       - name: Configure CMake (Android Bionic NCE)
         run: |
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "Using NDK Toolchain at: $NDK_PATH"
+
           mkdir build && cd build
           cmake .. \
             -GNinja \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-34 \
             -DANDROID_STL=c++_shared \
@@ -63,17 +66,17 @@ jobs:
       - name: Compile Bionic Targets
         run: |
           cd build
-          # 优先编译 core 与 yuzu-cmd 基础库
+          # 优先编译 yuzu-cmd 或全量目标
           ninja -j$(nproc) yuzu-cmd || ninja -j$(nproc)
 
       - name: Prepare Artifacts
         run: |
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
           mkdir -p dist/
-          # 收集生成的可执行文件与 C++ 共享运行库
           find build/bin -type f -exec cp {} dist/ \; 2>/dev/null || true
           find build -name "yuzu-cmd" -exec cp {} dist/ \; 2>/dev/null || true
           find build -name "eden-cli" -exec cp {} dist/ \; 2>/dev/null || true
-          cp $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so dist/
+          cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" dist/ || true
           ls -lh dist/
 
       - name: Upload Bionic Binaries
