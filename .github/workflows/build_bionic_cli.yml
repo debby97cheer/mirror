@@ -24,22 +24,35 @@ jobs:
       - name: Install Host Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build ccache glslang-tools nasm
+          sudo apt-get install -y cmake ninja-build ccache glslang-tools nasm libtool
 
-      - name: Setup Android NDK (r27c for full C++20 stop_token support)
+      - name: Setup Android NDK
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27c
           add-to-path: true
 
-      - name: Patch Source & CMake for Bionic CLI Build
+      - name: Inspect & Force Enable CLI in CMake
         run: |
-          echo "[*] 解除 NOT ANDROID 限制并确保必要前端被引入..."
+          echo "=== 1. 探测源码中所有定义的可执行程序目录 ==="
+          find src -name "CMakeLists.txt" -exec grep -H "add_executable" {} + || true
+
+          echo "=== 2. 解除 Android 限制，强制引入 CLI 子目录 ==="
+          # 解除根目录与 src 目录限制
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' CMakeLists.txt || true
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' src/CMakeLists.txt || true
 
-          echo "[*] 为 polyfill_thread.h 提供 stop_token 显式引用兜底..."
+          # 如果 src/CMakeLists.txt 中有针对 yuzu_cmd 或 eden_cli 的条件判断，强制引入
+          if [ -d "src/yuzu_cmd" ]; then
+            echo 'add_subdirectory(yuzu_cmd)' >> src/CMakeLists.txt
+          elif [ -d "src/eden_cli" ]; then
+            echo 'add_subdirectory(eden_cli)' >> src/CMakeLists.txt
+          elif [ -d "src/eden_cmd" ]; then
+            echo 'add_subdirectory(eden_cmd)' >> src/CMakeLists.txt
+          fi
+
+          echo "=== 3. 补充 polyfill_thread.h 的 stop_token 引用 ==="
           if [ -f src/common/polyfill_thread.h ]; then
             grep -q "#include <stop_token>" src/common/polyfill_thread.h || sed -i '1i #include <stop_token>' src/common/polyfill_thread.h
           fi
@@ -47,12 +60,11 @@ jobs:
             grep -q "#include <stop_token>" src/common/thread.h || sed -i '1i #include <stop_token>' src/common/thread.h
           fi
 
-      - name: Configure CMake (Android Bionic NCE)
+      - name: Configure CMake
         run: |
           NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-          echo "Using NDK Toolchain at: $NDK_PATH"
-
           mkdir build && cd build
+
           cmake .. \
             -GNinja \
             -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
@@ -62,6 +74,8 @@ jobs:
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_QT=OFF \
+            -DENABLE_SDL2=ON \
+            -DENABLE_SDL3=ON \
             -DYUZU_CMD=ON \
             -DEDEN_CLI=ON \
             -DENABLE_NCE=ON \
@@ -75,31 +89,38 @@ jobs:
       - name: Compile Bionic Targets
         run: |
           cd build
-          echo "=== 查看所有可执行目标 ==="
-          ninja -t targets | grep -E "cli|cmd|eden|yuzu" || true
+          echo "=== 检查 Ninja 生成的所有可构建目标 ==="
+          ninja -t targets | grep -E "cmd|cli|yuzu|eden" || true
 
-          # 执行默认全量目标构建
+          # 编译所有目标
           ninja -j$(nproc)
 
       - name: Prepare Artifacts
         run: |
           NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-          mkdir -p dist/
+          # 创建全新的干净输出目录，避免被源码自带的 dist/ 污染
+          rm -rf output_bin && mkdir -p output_bin
 
-          # 自动收集构建出的所有二进制执行程序
-          find build/bin -type f -exec cp {} dist/ \; 2>/dev/null || true
-          find build -maxdepth 3 -type f -executable ! -name "*.so" ! -name "*.a" ! -name "*.sh" -exec cp {} dist/ \; 2>/dev/null || true
-          find build -name "*cli*" -type f -executable -exec cp {} dist/ \; 2>/dev/null || true
-          find build -name "*cmd*" -type f -executable -exec cp {} dist/ \; 2>/dev/null || true
+          echo "=== 收集构建出的真正二进制 ==="
+          # 只抓取 build/bin 下生成的文件
+          if [ -d "build/bin" ]; then
+            cp -rf build/bin/* output_bin/ 2>/dev/null || true
+          fi
 
-          # 抓取配对的 NDK 核心 C++ 运行时
-          cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" dist/ || true
+          # 递归抓取带有可执行权限且排除 CMake 临时测例的文件
+          find build -type f -executable \
+            ! -name "*.so" ! -name "*.a" ! -name "*.o" ! -name "*.bin" ! -name "*.sh" \
+            ! -path "*/CMakeFiles/*" \
+            -exec cp {} output_bin/ \; 2>/dev/null || true
 
-          echo "=== 收集到的构建产物清单 ==="
-          ls -lh dist/
+          # 拷贝 NDK C++ 运行时
+          cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" output_bin/ || true
+
+          echo "=== 最终打包文件列表 ==="
+          ls -lh output_bin/
 
       - name: Upload Bionic Binaries
         uses: actions/upload-artifact@v4
         with:
           name: eden-bionic-arm64
-          path: dist/
+          path: output_bin/
