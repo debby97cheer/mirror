@@ -33,32 +33,39 @@ jobs:
           ndk-version: r27c
           add-to-path: true
 
-      - name: Inspect & Force Enable CLI in CMake
+      - name: Patch Source & CMake for Bionic CLI Build
         run: |
-          echo "=== 1. 探测源码中所有定义的可执行程序目录 ==="
-          find src -name "CMakeLists.txt" -exec grep -H "add_executable" {} + || true
-
-          echo "=== 2. 解除 Android 限制，强制引入 CLI 子目录 ==="
-          # 解除根目录与 src 目录限制
+          echo "=== 1. 解除 Android 构建对 yuzu_cmd 的限制 ==="
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' CMakeLists.txt || true
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' src/CMakeLists.txt || true
 
-          # 如果 src/CMakeLists.txt 中有针对 yuzu_cmd 或 eden_cli 的条件判断，强制引入
           if [ -d "src/yuzu_cmd" ]; then
             echo 'add_subdirectory(yuzu_cmd)' >> src/CMakeLists.txt
-          elif [ -d "src/eden_cli" ]; then
-            echo 'add_subdirectory(eden_cli)' >> src/CMakeLists.txt
-          elif [ -d "src/eden_cmd" ]; then
-            echo 'add_subdirectory(eden_cmd)' >> src/CMakeLists.txt
           fi
 
-          echo "=== 3. 补充 polyfill_thread.h 的 stop_token 引用 ==="
+          echo "=== 2. 修复 C++20 stop_token 引用 ==="
           if [ -f src/common/polyfill_thread.h ]; then
             grep -q "#include <stop_token>" src/common/polyfill_thread.h || sed -i '1i #include <stop_token>' src/common/polyfill_thread.h
           fi
           if [ -f src/common/thread.h ]; then
             grep -q "#include <stop_token>" src/common/thread.h || sed -i '1i #include <stop_token>' src/common/thread.h
           fi
+
+          echo "=== 3. 修复 Android CLI 缺失 main 符号问题 (双保险补丁) ==="
+          # 3.1 在 yuzu.cpp 开头禁止 SDL 劫持 main
+          sed -i '1i #define SDL_MAIN_HANDLED 1' src/yuzu_cmd/yuzu.cpp
+
+          # 3.2 在末尾追加弱符号 main 兜底桥接
+          cat << 'EOF' >> src/yuzu_cmd/yuzu.cpp
+
+          #if defined(__ANDROID__)
+          #undef main
+          extern "C" int SDL_main(int argc, char* argv[]);
+          __attribute__((weak)) extern "C" int main(int argc, char* argv[]) {
+              return SDL_main(argc, argv);
+          }
+          #endif
+          EOF
 
       - name: Configure CMake
         run: |
@@ -77,46 +84,38 @@ jobs:
             -DENABLE_SDL2=ON \
             -DENABLE_SDL3=ON \
             -DYUZU_CMD=ON \
-            -DEDEN_CLI=ON \
             -DENABLE_NCE=ON \
             -DYUZU_USE_BUNDLED_VCPKG=OFF \
             -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF \
             -DYUZU_ENABLE_LTO=OFF \
             -DYUZU_TESTS=OFF \
+            -DCMAKE_C_FLAGS="-DSDL_MAIN_HANDLED" \
+            -DCMAKE_CXX_FLAGS="-DSDL_MAIN_HANDLED" \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld"
 
       - name: Compile Bionic Targets
         run: |
           cd build
-          echo "=== 检查 Ninja 生成的所有可构建目标 ==="
-          ninja -t targets | grep -E "cmd|cli|yuzu|eden" || true
-
-          # 编译所有目标
+          # 直接完成最后的编译链接
           ninja -j$(nproc)
 
       - name: Prepare Artifacts
         run: |
           NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-          # 创建全新的干净输出目录，避免被源码自带的 dist/ 污染
           rm -rf output_bin && mkdir -p output_bin
 
-          echo "=== 收集构建出的真正二进制 ==="
-          # 只抓取 build/bin 下生成的文件
-          if [ -d "build/bin" ]; then
-            cp -rf build/bin/* output_bin/ 2>/dev/null || true
+          echo "=== 提取可执行二进制与运行库 ==="
+          # 1. 抓取生成的最终 CLI 执行程序
+          if [ -f "build/bin/yuzu-cmd" ]; then
+            cp build/bin/yuzu-cmd output_bin/
           fi
+          find build/bin -type f -exec cp {} output_bin/ \; 2>/dev/null || true
 
-          # 递归抓取带有可执行权限且排除 CMake 临时测例的文件
-          find build -type f -executable \
-            ! -name "*.so" ! -name "*.a" ! -name "*.o" ! -name "*.bin" ! -name "*.sh" \
-            ! -path "*/CMakeFiles/*" \
-            -exec cp {} output_bin/ \; 2>/dev/null || true
-
-          # 拷贝 NDK C++ 运行时
+          # 2. 抓取配对的 NDK libc++_shared.so
           cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" output_bin/ || true
 
-          echo "=== 最终打包文件列表 ==="
+          echo "=== 打包产物确认 ==="
           ls -lh output_bin/
 
       - name: Upload Bionic Binaries
