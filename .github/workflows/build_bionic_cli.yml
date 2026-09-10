@@ -74,7 +74,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (融合架构解耦与符号闭环)
+      # 5. 精确源码重构 (剔除 mediandk 传递依赖与框架代码)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -164,7 +164,22 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.3 补齐 <stop_token> 头文件
+          # 5.3 剔除 CMakeLists.txt 中的 mediandk 传递依赖
+          # --------------------------------------------------------
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          for p in Path("src").rglob("CMakeLists.txt"):
+              text = p.read_text()
+              if "mediandk" in text:
+                  text = re.sub(r'\bmediandk\b', '', text)
+                  p.write_text(text)
+                  print(f"Removed mediandk dependency from: {p}")
+          PY
+
+          # --------------------------------------------------------
+          # 5.4 补齐 <stop_token> 头文件
           # --------------------------------------------------------
           for f in src/common/thread_worker.h src/common/polyfill_thread.h src/common/thread.h; do
             if [ -f "$f" ] && ! grep -q '#include <stop_token>' "$f"; then
@@ -174,7 +189,7 @@ jobs:
           done
 
           # --------------------------------------------------------
-          # 5.4 禁用 Android Input Engine (杜绝 Vibration 线程)
+          # 5.5 禁用 Android Input Engine (杜绝 Vibration 线程)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -198,7 +213,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.5 引入 android_settings.cpp (闭环 AndroidSettings::values)
+          # 5.6 引入 android_settings.cpp (闭环 AndroidSettings::values)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -219,7 +234,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.6 拦截电池状态分支 (语法安全，避免顶格代码)
+          # 5.7 拦截电池状态分支 (语法安全，避免顶格代码)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -238,7 +253,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.7 精确修改 yuzu.cpp (生命周期 + 短参数 + 闭环保护)
+          # 5.8 精确修改 yuzu.cpp (生命周期 + 短参数 + 闭环保护)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -316,7 +331,7 @@ jobs:
           if pattern_event.search(text):
               text = pattern_event.sub(replacement_event, text, count=1)
 
-          # 追加标准原生 main() 与 CPM 预编译 OpenSLES 闭环符号 (缩进对齐保护)
+          # 追加标准原生 main() 与 CPM 预编译 OpenSLES 闭环符号
           if "int main(int argc, char** argv)" not in text:
               native_main = (
                   "\n#ifdef YUZU_BIONIC_CLI\n\n"
@@ -377,7 +392,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 弹性修改 emu_window_sdl3.cpp (仅保留 VIDEO)
+          # 5.9 弹性修改 emu_window_sdl3.cpp (仅保留 VIDEO)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -409,7 +424,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.9 补丁 cpmfile.json 中的 SDL3 包选项
+          # 5.10 补丁 cpmfile.json 中的 SDL3 包选项
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -450,12 +465,12 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.10 清理 CPM SDL3 缓存
+          # 5.11 清理 CPM SDL3 缓存
           # --------------------------------------------------------
           rm -rf .cache/cpm/sdl3 || true
 
           # --------------------------------------------------------
-          # 5.11 链接 log 库
+          # 5.12 链接 log 库
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -474,26 +489,8 @@ jobs:
           path.write_text(text)
           PY
 
-          # --------------------------------------------------------
-          # 5.12 校验修改结果
-          # --------------------------------------------------------
-          echo "============================================================"
-          echo "VALIDATION: yuzu.cpp"
-          echo "============================================================"
-          grep -nE 'SDL_MAIN_HANDLED|SDL_MAIN_USE_CALLBACKS|int main\(|SDL_SetMainReady' src/yuzu_cmd/yuzu.cpp || true
-
-          echo "============================================================"
-          echo "VALIDATION: AndroidSettings"
-          echo "============================================================"
-          grep -n 'android_settings.cpp' src/yuzu_cmd/CMakeLists.txt || true
-
-          echo "============================================================"
-          echo "VALIDATION: Power state guard"
-          echo "============================================================"
-          grep -n 'YUZU_BIONIC_CLI' src/common/device_power_state.cpp || true
-
       # ============================================================
-      # 6. 配置 CMake
+      # 6. 配置 CMake (-Wl,--as-needed 消除未引用动态库)
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -547,8 +544,8 @@ jobs:
             -DYUZU_ENABLE_LTO=OFF \
             -DCMAKE_CXX_FLAGS="-fexperimental-library -DYUZU_BIONIC_CLI" \
             -DCMAKE_C_FLAGS="-fexperimental-library -DYUZU_BIONIC_CLI" \
-            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld"
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       # ============================================================
       # 7. 检查 CMake 配置
@@ -634,7 +631,7 @@ jobs:
               echo "ERROR: OpenSLES or MediaNDK dependency detected."
               exit 1
           fi
-          echo "PASS: Clean Bionic ELF verified."
+          echo "PASS: Clean Bionic ELF verified (No OpenSLES / MediaNDK)."
 
       # ============================================================
       # 11. 提取交付物
