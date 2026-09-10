@@ -66,7 +66,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精准手术：重构 yuzu.cpp 并注入宏定义与原生 main 入口
+      # 5. 精准手术：彻底解耦 SDL_MAIN 并植入 Native Bionic Main
       # ============================================================
       - name: Patch Eden Core and Yuzu CMD
         shell: bash
@@ -137,7 +137,7 @@ jobs:
           p.write_text(content)
           PY
 
-          echo "=== 5. 重构 yuzu.cpp：原生生命周期 + 闭环符号 + 稳固 main ==="
+          echo "=== 5. 单点深度重构 yuzu.cpp ==="
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -145,8 +145,15 @@ jobs:
           path = Path("src/yuzu_cmd/yuzu.cpp")
           text = path.read_text()
 
-          # 5.1 顶部替换：无条件以 SDL_MAIN_HANDLED 接管，杜绝 SDL 冲突
-          header_replacement = """#define SDL_MAIN_HANDLED
+          # 5.1 彻底清除 SDL_MAIN_USE_CALLBACKS 与现有 SDL_main.h 引用
+          text = re.sub(r'^[ \t]*#\s*define\s+SDL_MAIN_USE_CALLBACKS\b.*$', '', text, flags=re.MULTILINE)
+          text = re.sub(r'^[ \t]*#\s*include\s+<SDL3/SDL_main\.h>.*$', '', text, flags=re.MULTILINE)
+
+          # 5.2 在文件最头部注入 SDL_MAIN_HANDLED、闭环桩及 AndroidSettings
+          header_injection = """// [EDEN_BIONIC_CLI_CORE_HEADER]
+          #ifndef SDL_MAIN_HANDLED
+          #define SDL_MAIN_HANDLED 1
+          #endif
           #include <SDL3/SDL.h>
           #include <SDL3/SDL_main.h>
           #include <unistd.h>
@@ -164,7 +171,6 @@ jobs:
           std::atomic<bool> g_is_charging{false};
           std::atomic<bool> g_has_battery{true};
 
-          // 仅用于就地满足预编译 libSDL3.a 内部死代码对 NDK 的外部引用
           extern "C" {
           struct SLInterfaceID_ { uint32_t a; uint16_t b, c, d; uint8_t e[6]; };
           static const struct SLInterfaceID_ s_dummy = {0, 0, 0, 0, {0}};
@@ -213,28 +219,36 @@ jobs:
           }
           #endif
           """
+          text = header_injection + "\n" + text
 
+          # 5.3 扩展 getopt_long 短参数以支持 '-n'
           text = re.sub(
-              r'#define\s+SDL_MAIN_USE_CALLBACKS\s*\n\s*#include\s+<SDL3/SDL_main\.h>',
-              header_replacement,
-              text,
-              count=1
+              r'getopt_long\(([^,]+,[^,]+,)"([^"]*)"',
+              lambda m: f'getopt_long({m.group(1)}"{m.group(2) if "n" in m.group(2) else m.group(2) + "n"}"',
+              text
           )
 
-          # 5.2 确保 optstring 支持短参数 'n'
-          text = re.sub(r'getopt_long\(([^,]+,[^,]+,)"([^"]*)"', lambda m: f'getopt_long({m.group(1)}"{m.group(2) if "n" in m.group(2) else m.group(2) + "n"}"', text)
+          # 5.4 修复 SDL_AppInit 成功返回值为 SDL_APP_CONTINUE
+          if "void(state->system.Run());" in text:
+              idx = text.find("void(state->system.Run());")
+              ret_idx = text.find("return SDL_APP_SUCCESS;", idx)
+              if ret_idx != -1 and ret_idx - idx < 200:
+                  text = text[:ret_idx] + "return SDL_APP_CONTINUE;" + text[ret_idx + len("return SDL_APP_SUCCESS;"):]
+              else:
+                  text = text.replace("void(state->system.Run());", "void(state->system.Run());\n    return SDL_APP_CONTINUE;", 1)
 
-          # 5.3 修正 SDL_AppInit 成功时的返回值为 SDL_APP_CONTINUE
-          text = re.sub(r'void\s*\(\s*state->system\.Run\(\)\s*\)\s*;', 'void(state->system.Run());\n    return SDL_APP_CONTINUE;', text, count=1)
+          # 5.5 尾部注入原生 main()，并在定义前强制 #undef main 消除任何宏展开
+          main_impl = """
+          #ifdef main
+          #undef main
+          #endif
 
-          # 5.4 尾部注入原生 main() 入口函数
-          bionic_main = """
           extern "C" int main(int argc, char** argv) {
               if (chdir("/data/eden") != 0) {
                   // 工作目录容错
               }
 
-              // 明确告知 SDL3 库主入口已由原生层接管
+              // 明确通知 SDL3 运行时主入口已就绪
               SDL_SetMainReady();
 
               void* appstate = nullptr;
@@ -267,17 +281,18 @@ jobs:
               return (result == SDL_APP_SUCCESS) ? 0 : 1;
           }
           """
-          if "extern \"C\" int main(" not in text:
-              text += bionic_main
+          text += main_impl
 
-          # 严格断言：确保 main 已经被正确写入源码
-          assert "extern \"C\" int main(" in text, "CRITICAL ERROR: Failed to patch main() into yuzu.cpp!"
+          # 硬性断言检测
+          assert "SDL_MAIN_USE_CALLBACKS" not in text, "CRITICAL: SDL_MAIN_USE_CALLBACKS still exists!"
+          assert 'extern "C" int main(' in text, "CRITICAL: main() function missing from yuzu.cpp!"
+
           path.write_text(text)
-          print("SUCCESS: yuzu.cpp has been verified and patched with main()!")
+          print("SUCCESS: yuzu.cpp has been completely overhauled with a pure native main()!")
           PY
 
       # ============================================================
-      # 6. 配置 CMake (传递 -DYUZU_BIONIC_CLI 预编译宏)
+      # 6. 配置 CMake
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -355,7 +370,7 @@ jobs:
           fi
 
       # ============================================================
-      # 9. 校验依赖纯净度与导出符号
+      # 9. 校验依赖纯净度
       # ============================================================
       - name: Verify Clean Bionic ELF
         shell: bash
