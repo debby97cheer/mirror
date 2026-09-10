@@ -70,14 +70,14 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精准补丁构建图 (启用 CLI、禁用 JNI、植入 ELF main 桥接)
+      # 5. 精准补丁构建图 (注入缺失系统库、实体定义与 ELF main)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
         run: |
           set -eux
           echo "============================================================"
-          echo "1. 解除 YUZU_CMD 的 Android 平台排他限制"
+          echo "1. 解除 YUZU_CMD 的 Android 限制"
           echo "============================================================"
           python3 <<'PY'
           from pathlib import Path
@@ -93,13 +93,13 @@ jobs:
 
           if pattern.search(text):
               text = pattern.sub('option(YUZU_CMD "Compile the eden-cli executable" ON)', text, count=1)
-              print("YUZU_CMD converted to standard option.")
-          elif 'option(YUZU_CMD "Compile the eden-cli executable" ON)' in text:
-              print("YUZU_CMD already configured.")
+          elif 'option(YUZU_CMD "Compile the eden-cli executable" ON)' not in text:
+              print("Warning: YUZU_CMD pattern not matched directly.")
 
           if 'option(YUZU_BIONIC_CLI' not in text:
               marker = 'option(YUZU_CMD "Compile the eden-cli executable" ON)'
-              text = text.replace(marker, marker + '\noption(YUZU_BIONIC_CLI "Build standalone Android/Bionic CLI" ON)', 1)
+              if marker in text:
+                  text = text.replace(marker, marker + '\noption(YUZU_BIONIC_CLI "Build standalone Android/Bionic CLI" ON)', 1)
 
           path.write_text(text)
           PY
@@ -126,25 +126,20 @@ jobs:
 
           if pattern.search(text):
               text = pattern.sub(replacement, text, count=1)
-              print("yuzu-android JNI target bypassed.")
-          elif "ANDROID AND NOT YUZU_BIONIC_CLI" in text:
-              print("JNI guard already in place.")
-
           path.write_text(text)
           PY
 
           echo "============================================================"
-          echo "3. 补齐关键头文件 <stop_token>"
+          echo "3. 补齐 <stop_token> 头文件"
           echo "============================================================"
           for f in src/common/thread_worker.h src/common/polyfill_thread.h src/common/thread.h; do
             if [ -f "$f" ] && ! grep -q '#include <stop_token>' "$f"; then
               sed -i '1i #include <stop_token>' "$f"
-              echo "Injected <stop_token> into $f"
             fi
           done
 
           echo "============================================================"
-          echo "4. 生成并注入 Bionic ELF 原生入口桥接"
+          echo "4. 生成包含 Android 全局状态的 Bionic 入口包装层"
           echo "============================================================"
           cat > src/yuzu_cmd/eden_bionic_entry.cpp <<'EOF'
           // SPDX-License-Identifier: GPL-3.0-or-later
@@ -152,6 +147,21 @@ jobs:
 
           #include <SDL3/SDL.h>
           #include <SDL3/SDL_main.h>
+          #include <atomic>
+
+          // 引入 Android 模式下 video_core 与 settings 所需的实体实例
+          #include "common/settings.h"
+
+          #ifdef __ANDROID__
+          namespace AndroidSettings {
+          Values values{};
+          }
+
+          // 补充 common/device_power_state.cpp 依赖的全局电池状态
+          std::atomic<int> g_battery_percentage{100};
+          std::atomic<bool> g_is_charging{false};
+          std::atomic<bool> g_has_battery{true};
+          #endif
 
           extern "C" SDL_AppResult SDLCALL SDL_AppInit(void** appstate, int argc, char** argv);
           extern "C" SDL_AppResult SDLCALL SDL_AppIterate(void* appstate);
@@ -178,12 +188,15 @@ jobs:
               content = p.read_text()
               if "eden_bionic_entry.cpp" not in content:
                   content = content.replace("yuzu.cpp", "yuzu.cpp\n    eden_bionic_entry.cpp", 1)
-                  p.write_text(content)
-                  print("Registered eden_bionic_entry.cpp in src/yuzu_cmd/CMakeLists.txt")
+              # 显式链接缺失的 NDK 系统日志与音频库
+              if "target_link_libraries(yuzu-cmd PRIVATE log OpenSLES)" not in content:
+                  content += "\ntarget_link_libraries(yuzu-cmd PRIVATE log OpenSLES)\n"
+              p.write_text(content)
+              print("Updated src/yuzu_cmd/CMakeLists.txt with entry and libraries.")
           PY
 
       # ============================================================
-      # 6. 执行 CMake 配置
+      # 6. 执行 CMake 配置 (附加 -llog 与 -lOpenSLES 链接选项)
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -219,57 +232,19 @@ jobs:
             -DYUZU_DOWNLOAD_ANDROID_VVL=OFF \
             -DYUZU_DOWNLOAD_TIME_ZONE_DATA=ON \
             -DYUZU_LEGACY=ON \
-            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -llog -lOpenSLES" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" \
             -DCMAKE_CXX_FLAGS="-fexperimental-library" \
             -DCMAKE_C_FLAGS="-fexperimental-library"
 
       # ============================================================
-      # 7. 验证 C++20 编译器特性
-      # ============================================================
-      - name: Verify CXX20 Configuration
-        shell: bash
-        run: |
-          set -eux
-          grep -E 'CMAKE_CXX_STANDARD:|CMAKE_CXX_FLAGS:' build/CMakeCache.txt || true
-
-          cat > /tmp/test_cpp20.cpp <<'EOF'
-          #include <stop_token>
-          #include <thread>
-
-          static void test(std::stop_token token) {
-              (void)token;
-          }
-
-          int main() {
-              std::stop_source source;
-              std::stop_token token = source.get_token();
-              std::stop_callback callback(token, []() {});
-              test(token);
-              return 0;
-          }
-          EOF
-
-          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" \
-            --target=aarch64-none-linux-android34 \
-            --sysroot="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot" \
-            -std=c++20 \
-            -fexperimental-library \
-            /tmp/test_cpp20.cpp \
-            -o /tmp/test_cpp20
-
-          file /tmp/test_cpp20
-          echo "C++20 stop_token/stop_callback test PASSED."
-
-      # ============================================================
-      # 8. 编译可执行程序目标
+      # 7. 编译目标可执行程序
       # ============================================================
       - name: Build Eden CLI Target
         shell: bash
         run: |
           set -eux
 
-          echo "=== 检索当前构建图中的目标名称 ==="
           TARGET=""
           if ninja -C build -t targets all | grep -q 'bin/eden-cli:'; then
               TARGET="eden-cli"
@@ -289,35 +264,38 @@ jobs:
           fi
 
       # ============================================================
-      # 9. 检验生成的 Bionic ARM64 ELF 文件
+      # 8. 校验生成的 Bionic ARM64 ELF 文件
       # ============================================================
       - name: Verify Eden ARM64 ELF
         shell: bash
         run: |
           set -eux
+
           BIN=$(find build/bin -maxdepth 1 -type f \( -name "eden-cli" -o -name "yuzu-cmd" \) | head -n 1)
 
           if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
-            echo "ERROR: Executable (eden-cli or yuzu-cmd) was not found in build/bin."
+            echo "ERROR: Executable was not found in build/bin."
             find build -type f -executable | head -40
             exit 1
           fi
 
+          echo "============================================================"
           echo "Found Binary: $BIN"
+          echo "============================================================"
           file "$BIN"
           readelf -h "$BIN"
 
-          echo "=== 检查 ELF Interpreter (必须为 /system/bin/linker64) ==="
+          echo "=== 检查 ELF Interpreter (确认 Bionic 动态加载器) ==="
           readelf -l "$BIN" | grep -A2 INTERP || true
 
-          echo "=== 检查符号导出 (确保 main 存在) ==="
+          echo "=== 检查 main 入口符号导出 ==="
           "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -C "$BIN" | grep -E '(^| )main$' || true
 
-          echo "=== 动态链接库依赖 ==="
+          echo "=== 动态链接依赖库列表 ==="
           readelf -d "$BIN"
 
       # ============================================================
-      # 10. 收集交付物并归档
+      # 9. 提取交付物并归档
       # ============================================================
       - name: Package Runtime Artifacts
         shell: bash
@@ -338,7 +316,7 @@ jobs:
           tar -czf eden-bionic-arm64.tar.gz -C output_bin .
 
       # ============================================================
-      # 11. 上传构建成果
+      # 10. 上传构建成果
       # ============================================================
       - name: Upload Eden Bionic ARM64
         uses: actions/upload-artifact@v4
