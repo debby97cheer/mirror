@@ -74,7 +74,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (剔除 mediandk 传递依赖与框架代码)
+      # 5. 精确源码重构 (斩断 Android Framework 依赖链)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -85,7 +85,7 @@ jobs:
           echo "============================================================"
 
           # --------------------------------------------------------
-          # 5.1 强制开启 YUZU_CMD + 注册 YUZU_BIONIC_CLI 宏
+          # 5.1 开启 YUZU_CMD + 注册 YUZU_BIONIC_CLI 宏
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -164,7 +164,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.3 剔除 CMakeLists.txt 中的 mediandk 传递依赖
+          # 5.3 剔除 CMake 中的 mediandk
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -175,7 +175,7 @@ jobs:
               if "mediandk" in text:
                   text = re.sub(r'\bmediandk\b', '', text)
                   p.write_text(text)
-                  print(f"Removed mediandk dependency from: {p}")
+                  print(f"Removed mediandk from: {p}")
           PY
 
           # --------------------------------------------------------
@@ -234,7 +234,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.7 拦截电池状态分支 (语法安全，避免顶格代码)
+          # 5.7 拦截电池状态分支
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -253,7 +253,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 精确修改 yuzu.cpp (生命周期 + 短参数 + 闭环保护)
+          # 5.8 精确重构 yuzu.cpp (注入闭环桩消解 libandroid.so / libOpenSLES.so)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -331,11 +331,15 @@ jobs:
           if pattern_event.search(text):
               text = pattern_event.sub(replacement_event, text, count=1)
 
-          # 追加标准原生 main() 与 CPM 预编译 OpenSLES 闭环符号
+          # 追加标准原生 main() 与全部 NDK 闭环桩 (消除 libandroid.so 和 libOpenSLES.so)
           if "int main(int argc, char** argv)" not in text:
               native_main = (
                   "\n#ifdef YUZU_BIONIC_CLI\n\n"
+                  "#include <cstdint>\n"
+                  "#include <cstddef>\n"
+                  "#include <sys/types.h>\n\n"
                   "extern \"C\" {\n"
+                  "// 1. OpenSLES 闭环桩 (消解 libOpenSLES.so)\n"
                   "struct SLInterfaceID_ { uint32_t a; uint16_t b, c, d; uint8_t e[6]; };\n"
                   "static const struct SLInterfaceID_ s_dummy = {0, 0, 0, 0, {0}};\n"
                   "extern const struct SLInterfaceID_* const SL_IID_ENGINE = &s_dummy;\n"
@@ -343,7 +347,42 @@ jobs:
                   "extern const struct SLInterfaceID_* const SL_IID_ANDROIDSIMPLEBUFFERQUEUE = &s_dummy;\n"
                   "extern const struct SLInterfaceID_* const SL_IID_RECORD = &s_dummy;\n"
                   "extern const struct SLInterfaceID_* const SL_IID_PLAY = &s_dummy;\n"
-                  "int slCreateEngine(void*, uint32_t, const void*, uint32_t, const void*, const void*) { return 1; }\n"
+                  "int slCreateEngine(void*, uint32_t, const void*, uint32_t, const void*, const void*) { return 1; }\n\n"
+                  "// 2. ANativeWindow 闭环桩 (消解 libandroid.so -> libgui.so 依赖)\n"
+                  "int32_t ANativeWindow_setBuffersGeometry(void*, int32_t, int32_t, int32_t) { return 0; }\n"
+                  "int32_t ANativeWindow_getWidth(void*) { return 1800; }\n"
+                  "int32_t ANativeWindow_getHeight(void*) { return 2880; }\n"
+                  "int32_t ANativeWindow_getFormat(void*) { return 1; }\n"
+                  "void* ANativeWindow_fromSurface(void*, void*) { return nullptr; }\n"
+                  "void ANativeWindow_acquire(void*) {}\n"
+                  "void ANativeWindow_release(void*) {}\n"
+                  "int32_t ANativeWindow_lock(void*, void*, void*) { return -1; }\n"
+                  "int32_t ANativeWindow_unlockAndPost(void*) { return 0; }\n\n"
+                  "// 3. Android Sensor / Looper 闭环桩 (消解 SDL 传感器对 libandroid.so 的引用)\n"
+                  "void* ASensorManager_getInstance() { return nullptr; }\n"
+                  "void* ASensorManager_getInstanceForPackage(const char*) { return nullptr; }\n"
+                  "int ASensorManager_getSensorList(void*, void*) { return 0; }\n"
+                  "const char* ASensor_getName(void*) { return \"\"; }\n"
+                  "int ASensor_getType(void*) { return -1; }\n"
+                  "int ASensor_getMinDelay(void*) { return 0; }\n"
+                  "void* ASensorManager_createEventQueue(void*, void*, int, void*, void*) { return nullptr; }\n"
+                  "int ASensorManager_destroyEventQueue(void*, void*) { return 0; }\n"
+                  "int ASensorEventQueue_enableSensor(void*, void*) { return -1; }\n"
+                  "int ASensorEventQueue_disableSensor(void*, void*) { return 0; }\n"
+                  "int ASensorEventQueue_setEventRate(void*, void*, int32_t) { return 0; }\n"
+                  "ssize_t ASensorEventQueue_getEvents(void*, void*, size_t) { return 0; }\n"
+                  "void* ALooper_prepare(int) { return nullptr; }\n"
+                  "int ALooper_pollOnce(int, int*, int*, void**) { return -1; }\n"
+                  "void ALooper_wake(void*) {}\n"
+                  "void ALooper_acquire(void*) {}\n"
+                  "void ALooper_release(void*) {}\n\n"
+                  "// 4. Android Asset 闭环桩 (消解 SDL APK 资源包对 libandroid.so 的引用)\n"
+                  "void* AAssetManager_fromJava(void*, void*) { return nullptr; }\n"
+                  "void* AAssetManager_open(void*, const char*, int) { return nullptr; }\n"
+                  "int AAsset_read(void*, void*, size_t) { return 0; }\n"
+                  "int64_t AAsset_seek64(void*, int64_t, int) { return -1; }\n"
+                  "int64_t AAsset_getLength64(void*) { return 0; }\n"
+                  "void AAsset_close(void*) {}\n"
                   "}\n\n"
                   "int main(int argc, char** argv) {\n"
                   "    if (chdir(\"/data/eden\") != 0) {\n"
@@ -490,7 +529,7 @@ jobs:
           PY
 
       # ============================================================
-      # 6. 配置 CMake (-Wl,--as-needed 消除未引用动态库)
+      # 6. 配置 CMake (-Wl,--as-needed 精准剥离未使用的动态库)
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -548,14 +587,17 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       # ============================================================
-      # 7. 检查 CMake 配置
+      # 7. 从 Ninja 规则中清理多余链接库 (根除 libandroid / libmediandk)
       # ============================================================
-      - name: Inspect CMake Configuration
+      - name: Strip Dead Dynamic Libs From Ninja
         shell: bash
         run: |
           set -eux
-          grep -E 'YUZU_CMD:|YUZU_BIONIC_CLI:|YUZU_LEGACY:' build/CMakeCache.txt || true
-          grep -E '^SDL_(AUDIO|VIDEO|JOYSTICK|HAPTIC|HIDAPI|SENSOR|CAMERA|POWER|DUMMYVIDEO|VULKAN|OPENGLES|OPENGL):' build/CMakeCache.txt || true
+          echo "=== 清除 build.ninja 中多余的框架链接指令 ==="
+          sed -i -E 's|[^ ]*libmediandk\.so||g' build/build.ninja
+          sed -i -E 's|-lmediandk\b||g' build/build.ninja
+          sed -i -E 's|-landroid\b||g' build/build.ninja
+          sed -i -E 's|-lOpenSLES\b||g' build/build.ninja
 
       # ============================================================
       # 8. C++20 stop_token 验证
@@ -564,7 +606,6 @@ jobs:
         shell: bash
         run: |
           set -eux
-
           cat > /tmp/test_cpp20.cpp <<'EOF'
           #include <stop_token>
           #include <thread>
@@ -602,9 +643,9 @@ jobs:
           ninja -C build -j"$(nproc)" eden-cli
 
       # ============================================================
-      # 10. 校验 ELF 导出与动态依赖
+      # 10. 严格校验纯净度 (严禁包含任何框架动态库)
       # ============================================================
-      - name: Verify Eden ARM64 ELF
+      - name: Verify Clean Bionic ELF
         shell: bash
         run: |
           set -eux
@@ -612,7 +653,7 @@ jobs:
           test -f "$BIN"
 
           echo "============================================================"
-          echo "FILE & ELF HEADER"
+          echo "ELF HEADER"
           echo "============================================================"
           file "$BIN"
           readelf -h "$BIN"
@@ -627,11 +668,14 @@ jobs:
           echo "============================================================"
           readelf -d "$BIN"
 
-          if readelf -d "$BIN" | grep -E 'libOpenSLES\.so|libmediandk\.so'; then
-              echo "ERROR: OpenSLES or MediaNDK dependency detected."
+          # 熔断断言：严禁包含任何 Android Framework 库
+          for BANNED in OpenSLES mediandk android.so gui.so; do
+            if readelf -d "$BIN" | grep -i "$BANNED"; then
+              echo "CRITICAL ERROR: Banned library $BANNED detected!"
               exit 1
-          fi
-          echo "PASS: Clean Bionic ELF verified (No OpenSLES / MediaNDK)."
+            fi
+          done
+          echo "PASS: Binary is 100% PURE Native Bionic ELF!"
 
       # ============================================================
       # 11. 提取交付物
