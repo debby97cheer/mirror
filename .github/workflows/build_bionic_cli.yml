@@ -26,18 +26,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build ccache glslang-tools nasm
 
-      - name: Setup Android NDK
+      - name: Setup Android NDK (r27c for full C++20 stop_token support)
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r26b
+          ndk-version: r27c
           add-to-path: true
 
-      - name: Patch CMake for Bionic CLI Build
+      - name: Patch Source & CMake for Bionic CLI Build
         run: |
-          echo "[*] 解除 yuzu_cmd 的 NOT ANDROID 限制..."
+          echo "[*] 解除 NOT ANDROID 限制并确保必要前端被引入..."
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' CMakeLists.txt || true
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' src/CMakeLists.txt || true
+
+          echo "[*] 为 polyfill_thread.h 提供 stop_token 显式引用兜底..."
+          if [ -f src/common/polyfill_thread.h ]; then
+            grep -q "#include <stop_token>" src/common/polyfill_thread.h || sed -i '1i #include <stop_token>' src/common/polyfill_thread.h
+          fi
+          if [ -f src/common/thread.h ]; then
+            grep -q "#include <stop_token>" src/common/thread.h || sed -i '1i #include <stop_token>' src/common/thread.h
+          fi
 
       - name: Configure CMake (Android Bionic NCE)
         run: |
@@ -54,29 +62,40 @@ jobs:
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_QT=OFF \
-            -DENABLE_SDL2=OFF \
+            -DYUZU_CMD=ON \
+            -DEDEN_CLI=ON \
             -DENABLE_NCE=ON \
             -DYUZU_USE_BUNDLED_VCPKG=OFF \
             -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF \
             -DYUZU_ENABLE_LTO=OFF \
             -DYUZU_TESTS=OFF \
-            -DCMAKE_C_FLAGS="-fuse-ld=lld" \
-            -DCMAKE_CXX_FLAGS="-fuse-ld=lld"
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld"
 
       - name: Compile Bionic Targets
         run: |
           cd build
-          # 优先编译 yuzu-cmd 或全量目标
-          ninja -j$(nproc) yuzu-cmd || ninja -j$(nproc)
+          echo "=== 查看所有可执行目标 ==="
+          ninja -t targets | grep -E "cli|cmd|eden|yuzu" || true
+
+          # 执行默认全量目标构建
+          ninja -j$(nproc)
 
       - name: Prepare Artifacts
         run: |
           NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
           mkdir -p dist/
+
+          # 自动收集构建出的所有二进制执行程序
           find build/bin -type f -exec cp {} dist/ \; 2>/dev/null || true
-          find build -name "yuzu-cmd" -exec cp {} dist/ \; 2>/dev/null || true
-          find build -name "eden-cli" -exec cp {} dist/ \; 2>/dev/null || true
+          find build -maxdepth 3 -type f -executable ! -name "*.so" ! -name "*.a" ! -name "*.sh" -exec cp {} dist/ \; 2>/dev/null || true
+          find build -name "*cli*" -type f -executable -exec cp {} dist/ \; 2>/dev/null || true
+          find build -name "*cmd*" -type f -executable -exec cp {} dist/ \; 2>/dev/null || true
+
+          # 抓取配对的 NDK 核心 C++ 运行时
           cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" dist/ || true
+
+          echo "=== 收集到的构建产物清单 ==="
           ls -lh dist/
 
       - name: Upload Bionic Binaries
