@@ -35,16 +35,13 @@ jobs:
 
       - name: Patch CMake for Bionic CLI Build
         run: |
-          echo "=== 1. 解除 Android 构建对 yuzu_cmd 的限制 ==="
+          echo "=== 1. 全面放行 yuzu_cmd 前端构建 ==="
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' CMakeLists.txt || true
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' src/CMakeLists.txt || true
+          sed -i 's/if (ENABLE_SDL2)/if (TRUE)/g' src/CMakeLists.txt || true
+          sed -i 's/if (YUZU_CMD)/if (TRUE)/g' src/CMakeLists.txt || true
 
-          # 确保 yuzu_cmd 子目录被正确注册（防止重复追加）
-          if [ -d "src/yuzu_cmd" ] && ! grep -q 'add_subdirectory(yuzu_cmd)' src/CMakeLists.txt; then
-            echo 'add_subdirectory(yuzu_cmd)' >> src/CMakeLists.txt
-          fi
-
-          echo "=== 2. 补齐 C++20 stop_token 头文件兜底 ==="
+          echo "=== 2. 补齐 C++20 stop_token 兜底 ==="
           if [ -f src/common/polyfill_thread.h ]; then
             grep -q "#include <stop_token>" src/common/polyfill_thread.h || sed -i '1i #include <stop_token>' src/common/polyfill_thread.h
           fi
@@ -52,9 +49,10 @@ jobs:
             grep -q "#include <stop_token>" src/common/thread.h || sed -i '1i #include <stop_token>' src/common/thread.h
           fi
 
-          echo "=== 3. 检查原生 yuzu.cpp 入口函数定义 (保持原文件完全未被修改) ==="
-          grep -nE '(int|auto)[[:space:]]+(SDL_main|main)[[:space:]]*\(' src/yuzu_cmd/yuzu.cpp || true
-          git status -s
+          echo "=== 3. 根治 main 符号劫持 (在 yuzu_cmd 目标中永久注入 SDL_MAIN_HANDLED) ==="
+          if [ -f "src/yuzu_cmd/CMakeLists.txt" ]; then
+            echo 'target_compile_definitions(yuzu-cmd PRIVATE SDL_MAIN_HANDLED=1)' >> src/yuzu_cmd/CMakeLists.txt
+          fi
 
       - name: Configure CMake (Android Bionic NCE)
         run: |
@@ -72,6 +70,7 @@ jobs:
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_QT=OFF \
+            -DENABLE_SDL2=ON \
             -DENABLE_SDL3=ON \
             -DYUZU_CMD=ON \
             -DENABLE_NCE=ON \
@@ -82,23 +81,14 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld"
 
-      - name: Compile Target (yuzu-cmd only)
+      - name: Compile Target (yuzu-cmd)
         run: |
           cd build
-          echo "=== 编译目标: yuzu-cmd ==="
-          # 仅编译 yuzu-cmd 及其直接依赖库，跳过未使用的 yuzu-android
-          ninja -j$(nproc) yuzu-cmd
+          echo "=== 检查已生成的 CLI 目标 ==="
+          ninja -t targets | grep "yuzu-cmd" || true
 
-      - name: Inspect Executable Symbols
-        if: always()
-        run: |
-          echo "=== 检查生成的 yuzu.cpp.o 符号表 ==="
-          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
-          NM="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-          OBJ="build/src/yuzu_cmd/CMakeFiles/yuzu-cmd.dir/yuzu.cpp.o"
-          if [ -f "$OBJ" ]; then
-            $NM -C "$OBJ" | grep -E '(^| )main$|SDL_main' || true
-          fi
+          echo "=== 开始链接 yuzu-cmd ==="
+          ninja -j$(nproc) yuzu-cmd
 
       - name: Prepare Artifacts
         run: |
