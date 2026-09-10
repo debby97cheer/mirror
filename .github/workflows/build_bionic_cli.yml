@@ -24,26 +24,27 @@ jobs:
       - name: Install Host Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build ccache glslang-tools nasm libtool python3
+          sudo apt-get install -y cmake ninja-build ccache glslang-tools nasm libtool
 
-      - name: Setup Android NDK
+      - name: Setup Android NDK (r27c)
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27c
           add-to-path: true
 
-      - name: Patch Source & CMake for Bionic CLI Build
+      - name: Patch CMake for Bionic CLI Build
         run: |
           echo "=== 1. 解除 Android 构建对 yuzu_cmd 的限制 ==="
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' CMakeLists.txt || true
           sed -i 's/if (NOT ANDROID)/if (TRUE)/g' src/CMakeLists.txt || true
 
-          if [ -d "src/yuzu_cmd" ]; then
+          # 确保 yuzu_cmd 子目录被正确注册（防止重复追加）
+          if [ -d "src/yuzu_cmd" ] && ! grep -q 'add_subdirectory(yuzu_cmd)' src/CMakeLists.txt; then
             echo 'add_subdirectory(yuzu_cmd)' >> src/CMakeLists.txt
           fi
 
-          echo "=== 2. 修复 C++20 stop_token 引用 ==="
+          echo "=== 2. 补齐 C++20 stop_token 头文件兜底 ==="
           if [ -f src/common/polyfill_thread.h ]; then
             grep -q "#include <stop_token>" src/common/polyfill_thread.h || sed -i '1i #include <stop_token>' src/common/polyfill_thread.h
           fi
@@ -51,33 +52,15 @@ jobs:
             grep -q "#include <stop_token>" src/common/thread.h || sed -i '1i #include <stop_token>' src/common/thread.h
           fi
 
-          echo "=== 3. 根治 yuzu.cpp 中的 main 入口 ==="
-          python3 -c '
-          import re
+          echo "=== 3. 检查原生 yuzu.cpp 入口函数定义 (保持原文件完全未被修改) ==="
+          grep -nE '(int|auto)[[:space:]]+(SDL_main|main)[[:space:]]*\(' src/yuzu_cmd/yuzu.cpp || true
+          git status -s
 
-          with open("src/yuzu_cmd/yuzu.cpp", "r") as f:
-              code = f.read()
-
-          # 移除先前测试中可能追加的 SDL_main 错误代码
-          code = re.sub(r"#if defined\(__ANDROID__\)[\s\S]*?#endif", "", code)
-
-          # 确保顶部定义 SDL_MAIN_HANDLED
-          if "#define SDL_MAIN_HANDLED" not in code:
-              code = "#define SDL_MAIN_HANDLED 1\n" + code
-
-          # 统一将 int SDL_main 或 int main 转为绝对纯净的 extern "C" int main
-          code = re.sub(r"int\s+SDL_main\s*\(", "extern \"C\" int main(", code)
-          code = re.sub(r"(int\s+main\s*\([^)]*\))", r"#undef main\nextern \"C\" \1", code)
-
-          with open("src/yuzu_cmd/yuzu.cpp", "w") as f:
-              f.write(code)
-
-          print("--- yuzu.cpp main 替换完成 ---")
-          '
-
-      - name: Configure CMake
+      - name: Configure CMake (Android Bionic NCE)
         run: |
           NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "Using NDK Toolchain at: $NDK_PATH"
+
           mkdir build && cd build
 
           cmake .. \
@@ -89,7 +72,6 @@ jobs:
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_QT=OFF \
-            -DENABLE_SDL2=ON \
             -DENABLE_SDL3=ON \
             -DYUZU_CMD=ON \
             -DENABLE_NCE=ON \
@@ -97,16 +79,26 @@ jobs:
             -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF \
             -DYUZU_ENABLE_LTO=OFF \
             -DYUZU_TESTS=OFF \
-            -DCMAKE_C_FLAGS="-DSDL_MAIN_HANDLED" \
-            -DCMAKE_CXX_FLAGS="-DSDL_MAIN_HANDLED" \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld"
 
-      - name: Compile Bionic Targets
+      - name: Compile Target (yuzu-cmd only)
         run: |
           cd build
-          # 执行完整编译链接
-          ninja -j$(nproc)
+          echo "=== 编译目标: yuzu-cmd ==="
+          # 仅编译 yuzu-cmd 及其直接依赖库，跳过未使用的 yuzu-android
+          ninja -j$(nproc) yuzu-cmd
+
+      - name: Inspect Executable Symbols
+        if: always()
+        run: |
+          echo "=== 检查生成的 yuzu.cpp.o 符号表 ==="
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          NM="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+          OBJ="build/src/yuzu_cmd/CMakeFiles/yuzu-cmd.dir/yuzu.cpp.o"
+          if [ -f "$OBJ" ]; then
+            $NM -C "$OBJ" | grep -E '(^| )main$|SDL_main' || true
+          fi
 
       - name: Prepare Artifacts
         run: |
@@ -114,16 +106,15 @@ jobs:
           rm -rf output_bin && mkdir -p output_bin
 
           echo "=== 提取构建产物 ==="
-          # 提取最终生成的命令行可执行程序
           if [ -f "build/bin/yuzu-cmd" ]; then
             cp build/bin/yuzu-cmd output_bin/
           fi
           find build/bin -type f -exec cp {} output_bin/ \; 2>/dev/null || true
 
-          # 提取配套的 NDK C++ 运行时共享库
+          # 提取配套 NDK libc++_shared.so 运行时
           cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" output_bin/ || true
 
-          echo "=== 最终构建交付清单 ==="
+          echo "=== 打包清单 ==="
           ls -lh output_bin/
 
       - name: Upload Bionic Binaries
