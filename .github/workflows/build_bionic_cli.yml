@@ -72,7 +72,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (纯净 Bionic 原生 CLI)
+      # 5. 精确源码重构 (严格执行 GPT 原生 Bionic 方案，绝无假桩)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -83,7 +83,7 @@ jobs:
           echo "============================================================"
 
           # --------------------------------------------------------
-          # 5.1 启用 YUZU_CMD 并增加 YUZU_BIONIC_CLI 宏支持
+          # 5.1 启用 YUZU_CMD 并定义 YUZU_BIONIC_CLI 宏
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -127,7 +127,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.2 排除 yuzu-android JNI 编译
+          # 5.2 排除 yuzu-android JNI 模块
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -160,7 +160,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.3 补齐 <stop_token> 头文件引入
+          # 5.3 补齐 <stop_token> 头文件
           # --------------------------------------------------------
           for f in src/common/thread_worker.h src/common/polyfill_thread.h src/common/thread.h; do
             if [ -f "$f" ] && ! grep -q '#include <stop_token>' "$f"; then
@@ -169,7 +169,7 @@ jobs:
           done
 
           # --------------------------------------------------------
-          # 5.4 在 input_common 中阻断 Android Engine 实例化
+          # 5.4 阻断 Android Input Engine 实例化 (彻底消灭 Vibration 线程)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -193,7 +193,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.5 精确重构 yuzu.cpp (生命周期 + 短参数 + 符号闭环)
+          # 5.5 精确重构 yuzu.cpp (零假桩，仅改造生命周期与短参数)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -212,7 +212,7 @@ jobs:
                   1
               )
 
-          # 替换 SDL main 模式
+          # 切换 SDL main 声明模式
           pattern_sdl_main = re.compile(
               r'#define\s+SDL_MAIN_USE_CALLBACKS\s+1.*?\n\s*#include\s+<SDL3/SDL_main\.h>',
               re.MULTILINE
@@ -227,21 +227,6 @@ jobs:
           )
           text = pattern_sdl_main.sub(new_sdl_main, text, count=1)
 
-          # 提供原属于 yuzu-android 的平台全局变量定义
-          android_globals = """
-          #if defined(YUZU_BIONIC_CLI) && defined(__ANDROID__)
-          #include <atomic>
-          namespace AndroidSettings {
-          Settings::Values values{};
-          }
-          std::atomic<int> g_battery_percentage{100};
-          std::atomic<bool> g_is_charging{false};
-          std::atomic<bool> g_has_battery{true};
-          #endif
-          """
-          if "namespace AndroidSettings" not in text:
-              text = text.replace("#include <SDL3/SDL_main.h>", "#include <SDL3/SDL_main.h>\n" + android_globals, 1)
-
           # 修正 optstring：补充短参数 'n'
           text = re.sub(
               r'getopt_long\s*\(\s*argc\s*,\s*argv\s*,\s*"[^"]*"',
@@ -249,7 +234,7 @@ jobs:
               text
           )
 
-          # 修正 long_options 参数配置
+          # 修正 long_options 潜在的参数属性缺失
           text = text.replace(
               '{"input-profile", no_argument, 0, \'i\'},',
               '{"input-profile", required_argument, 0, \'i\'},'
@@ -259,7 +244,7 @@ jobs:
               '{"filter", required_argument, 0, \'x\'},'
           )
 
-          # 修正 SDL_AppInit 保持运行
+          # 修正 SDL_AppInit 保持主线程运行
           pattern_tail = re.compile(
               r'(void\s*\(\s*state->system\.Run\(\)\s*\)\s*;\s*\n\s*'
               r'if\s*\(\s*state->system\.DebuggerEnabled\(\)\s*\)\s*\n\s*'
@@ -278,7 +263,7 @@ jobs:
           )
           text = pattern_tail.sub(new_tail, text, count=1)
 
-          # 修正 SDL_AppEvent 退出逻辑
+          # 修正 SDL_AppEvent 退出判定
           pattern_event = re.compile(
               r'(extern\s+"C"\s+SDL_AppResult\s+SDL_AppEvent\s*\([^)]*\)\s*\{[^{}]*?'
               r'state->emu_window->OnEvent\(\*event\);\s*\n\s*)'
@@ -298,59 +283,59 @@ jobs:
           )
           text = pattern_event.sub(new_event, text, count=1)
 
-          # 追加标准原生 main()
+          # 追加原生 main()
           if "int main(int argc, char** argv)" not in text:
               native_main = r'''
-          #ifdef YUZU_BIONIC_CLI
+#ifdef YUZU_BIONIC_CLI
 
-          int main(int argc, char** argv) {
-              if (chdir("/data/eden") != 0) {
-                  std::cerr << "Warning: unable to chdir to /data/eden" << std::endl;
-              }
+int main(int argc, char** argv) {
+    if (chdir("/data/eden") != 0) {
+        std::cerr << "Warning: unable to chdir to /data/eden" << std::endl;
+    }
 
-              SDL_SetMainReady();
+    SDL_SetMainReady();
 
-              for (int i = 1; i < argc; ++i) {
-                  if (std::strcmp(argv[i], "-n") == 0 ||
-                      std::strcmp(argv[i], "--null-render") == 0) {
-                      SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
-                      break;
-                  }
-              }
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "-n") == 0 ||
+            std::strcmp(argv[i], "--null-render") == 0) {
+            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
+            break;
+        }
+    }
 
-              void* appstate = nullptr;
-              SDL_AppResult result = SDL_AppInit(&appstate, argc, argv);
+    void* appstate = nullptr;
+    SDL_AppResult result = SDL_AppInit(&appstate, argc, argv);
 
-              if (result != SDL_APP_CONTINUE) {
-                  if (appstate != nullptr) {
-                      SDL_AppQuit(appstate, result);
-                  }
-                  return 0;
-              }
+    if (result != SDL_APP_CONTINUE) {
+        if (appstate != nullptr) {
+            SDL_AppQuit(appstate, result);
+        }
+        return 0;
+    }
 
-              while (result == SDL_APP_CONTINUE) {
-                  SDL_Event event{};
-                  while (SDL_PollEvent(&event)) {
-                      result = SDL_AppEvent(appstate, &event);
-                      if (result != SDL_APP_CONTINUE) {
-                          break;
-                      }
-                  }
-                  if (result != SDL_APP_CONTINUE) {
-                      break;
-                  }
-                  result = SDL_AppIterate(appstate);
-              }
+    while (result == SDL_APP_CONTINUE) {
+        SDL_Event event{};
+        while (SDL_PollEvent(&event)) {
+            result = SDL_AppEvent(appstate, &event);
+            if (result != SDL_APP_CONTINUE) {
+                break;
+            }
+        }
+        if (result != SDL_APP_CONTINUE) {
+            break;
+        }
+        result = SDL_AppIterate(appstate);
+    }
 
-              if (appstate != nullptr) {
-                  SDL_AppQuit(appstate, result);
-              }
+    if (appstate != nullptr) {
+        SDL_AppQuit(appstate, result);
+    }
 
-              return result == SDL_APP_SUCCESS ? 0 : 1;
-          }
+    return result == SDL_APP_SUCCESS ? 0 : 1;
+}
 
-          #endif
-          '''
+#endif
+'''
               text += native_main
 
           path.write_text(text)
@@ -396,7 +381,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 源码验证打印
+          # 5.8 校验关键逻辑修改结果
           # --------------------------------------------------------
           echo "============================================================"
           echo "VALIDATION: yuzu.cpp"
@@ -419,7 +404,7 @@ jobs:
           grep -n -C3 'SDL_Init' src/yuzu_cmd/emu_window/emu_window_sdl3.cpp
 
       # ============================================================
-      # 6. 配置 CMake (-fexperimental-library 关键修复)
+      # 6. 配置 CMake (-fexperimental-library 必须项)
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -487,7 +472,7 @@ jobs:
           grep -E 'CMAKE_CXX_FLAGS' build/CMakeCache.txt || true
 
       # ============================================================
-      # 8. C++20 stop_token 验证 (带 -fexperimental-library)
+      # 8. C++20 stop_token 验证
       # ============================================================
       - name: Verify CXX20 stop_token
         shell: bash
