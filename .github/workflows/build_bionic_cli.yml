@@ -74,7 +74,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (回传 appstate 上下文 + 闭环保护)
+      # 5. 精确源码重构 (无头 EmuWindow + 进程遥测)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -253,7 +253,51 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 深度重构 yuzu.cpp (回传 appstate + 空指针防线 + 实时输出)
+          # 5.8 核心修复：改造 emu_window_sdl3.cpp 为纯无头模式
+          # 彻底跳过 SDL_Init(SDL_INIT_VIDEO) 与 SDL_CreateWindow
+          # --------------------------------------------------------
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("src/yuzu_cmd/emu_window/emu_window_sdl3.cpp")
+          if not path.exists():
+              raise SystemExit("ERROR: emu_window_sdl3.cpp not found.")
+
+          text = path.read_text()
+
+          if "#include <iostream>" not in text:
+              text = "#include <iostream>\n" + text
+
+          # 在 input_subsystem->Initialize() 之后立即切断物理窗口创建
+          pattern = re.compile(r'(input_subsystem->Initialize\(\)\s*;\s*\n)')
+          injection = r'''\1#ifdef YUZU_BIONIC_CLI
+    std::cout << "[BIONIC] EmuWindow_SDL3: Headless CLI mode - bypassing physical SDL window & SurfaceFlinger" << std::endl;
+    is_open = true;
+    render_window = nullptr;
+    NotifyScreenLayoutChanged(Layout::DefaultFrameLayout(1280, 720));
+    return;
+#endif
+'''
+          if pattern.search(text):
+              text = pattern.sub(injection, text, count=1)
+              print("EmuWindow_SDL3 successfully patched to Headless CLI mode!")
+          else:
+              raise SystemExit("ERROR: Could not find input_subsystem->Initialize() in emu_window_sdl3.cpp")
+
+          # 析构函数安全保护
+          pattern_dtor = re.compile(r'EmuWindow_SDL3::~EmuWindow_SDL3\(\)\s*\{')
+          injection_dtor = """EmuWindow_SDL3::~EmuWindow_SDL3() {
+#ifdef YUZU_BIONIC_CLI
+    return;
+#endif"""
+          text = pattern_dtor.sub(injection_dtor, text, count=1)
+
+          path.write_text(text)
+          PY
+
+          # --------------------------------------------------------
+          # 5.9 深度重构 yuzu.cpp (步骤遥测 + 闭环保护 + 实时终端输出)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -275,7 +319,6 @@ jobs:
                   1
               )
 
-          # 切换 SDL main 声明模式
           pattern_sdl_main = re.compile(
               r'#define\s+SDL_MAIN_USE_CALLBACKS\s+1.*?\n\s*#include\s+<SDL3/SDL_main\.h>',
               re.MULTILINE
@@ -291,7 +334,6 @@ jobs:
           if pattern_sdl_main.search(text):
               text = pattern_sdl_main.sub(new_sdl_main, text, count=1)
 
-          # 修正 optstring：补充短参数 'n'
           new_optstring = "g:fhvnc:m:p::u:d:i:sx:"
           text = re.sub(
               r'getopt_long\s*\(\s*argc\s*,\s*argv\s*,\s*"[^"]*"',
@@ -300,7 +342,6 @@ jobs:
               count=1
           )
 
-          # 修正 long_options 参数属性
           text = text.replace(
               '{"input-profile", no_argument, 0, \'i\'},',
               '{"input-profile", required_argument, 0, \'i\'},'
@@ -310,7 +351,25 @@ jobs:
               '{"filter", required_argument, 0, \'x\'},'
           )
 
-          # 核心修复 1：在 SDL_AppInit 成功返回前回传 *appstate = state
+          # 插入执行遥测跟踪点
+          text = text.replace(
+              'state->system.Initialize();',
+              'std::cout << "[BIONIC] Step 1: Initializing System Core..." << std::endl;\n    state->system.Initialize();\n    std::cout << "[BIONIC] Step 2: System Core Initialized. Creating InputSubsystem..." << std::endl;'
+          )
+          text = text.replace(
+              'state->system.ApplySettings();',
+              'std::cout << "[BIONIC] Step 3: InputSubsystem Ready. Applying settings..." << std::endl;\n    state->system.ApplySettings();\n    std::cout << "[BIONIC] Step 4: Settings Applied. Selected backend=" << static_cast<int>(Settings::values.renderer_backend.GetValue()) << ". Creating EmuWindow..." << std::endl;'
+          )
+          text = text.replace(
+              'state->system.SetContentProvider',
+              'std::cout << "[BIONIC] Step 5: EmuWindow Ready! Initializing Filesystem..." << std::endl;\n    state->system.SetContentProvider'
+          )
+          text = text.replace(
+              'const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, filepath, load_parameters);',
+              'std::cout << "[BIONIC] Step 6: Ready to Load ROM: " << filepath << std::endl;\n    const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, filepath, load_parameters);\n    std::cout << "[BIONIC] Step 7: Load completed with status: " << static_cast<int>(load_result) << std::endl;'
+          )
+
+          # 赋值 *appstate = state
           pattern_tail = re.compile(
               r'(void\s*\(\s*state->system\.Run\(\)\s*\)\s*;\s*\n\s*'
               r'if\s*\(\s*state->system\.DebuggerEnabled\(\)\s*\)\s*\n\s*'
@@ -321,6 +380,7 @@ jobs:
           new_tail = (
               r'\1'
               "#ifdef YUZU_BIONIC_CLI\n"
+              "    std::cout << \"[BIONIC] Step 8: System Run! Entering iteration loop...\" << std::endl;\n"
               "    if (appstate != nullptr) {\n"
               "        *appstate = state;\n"
               "    }\n"
@@ -332,9 +392,8 @@ jobs:
           )
           if pattern_tail.search(text):
               text = pattern_tail.sub(new_tail, text, count=1)
-              print("AppInit tail successfully patched with *appstate assignment!")
 
-          # 核心修复 2：防御式重写 SDL_AppIterate / SDL_AppEvent / SDL_AppQuit
+          # 回调空指针防线
           old_callbacks = re.compile(
               r'extern\s+"C"\s+SDL_AppResult\s+SDL_AppIterate\s*\([^)]*\)\s*\{.*?'
               r'extern\s+"C"\s+void\s+SDL_AppQuit\s*\([^)]*\)\s*\{.*?delete\s+state\s*;\s*\}',
@@ -350,7 +409,7 @@ jobs:
               'extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {\n'
               '    if (!appstate) return SDL_APP_FAILURE;\n'
               '    SdlState *state = (SdlState *)appstate;\n'
-              '    if (state->emu_window) state->emu_window->OnEvent(*event);\n'
+              '    if (state->emu_window && event) state->emu_window->OnEvent(*event);\n'
               '#ifdef YUZU_BIONIC_CLI\n'
               '    if (!state->emu_window) return SDL_APP_FAILURE;\n'
               '    return state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;\n'
@@ -369,9 +428,7 @@ jobs:
           )
           if old_callbacks.search(text):
               text = old_callbacks.sub(guarded_callbacks, text, count=1)
-              print("SDL Callbacks safely guarded against null dereferences!")
 
-          # 核心修复 3：追加标准原生 main() (无缓冲实时输出 + 闭环保护)
           if "int main(int argc, char** argv)" not in text:
               native_main = (
                   "\n#ifdef YUZU_BIONIC_CLI\n\n"
@@ -421,20 +478,12 @@ jobs:
                   "void AAsset_close(void*) {}\n"
                   "}\n\n"
                   "int main(int argc, char** argv) {\n"
-                  "    // 强制关闭标准 I/O 缓冲，让所有 Log 实时冲刷到终端\n"
                   "    setvbuf(stdout, nullptr, _IONBF, 0);\n"
                   "    setvbuf(stderr, nullptr, _IONBF, 0);\n\n"
                   "    if (chdir(\"/data/eden\") != 0) {\n"
                   "        std::cerr << \"Warning: unable to chdir to /data/eden\" << std::endl;\n"
                   "    }\n\n"
                   "    SDL_SetMainReady();\n\n"
-                  "    for (int i = 1; i < argc; ++i) {\n"
-                  "        if (std::strcmp(argv[i], \"-n\") == 0 ||\n"
-                  "            std::strcmp(argv[i], \"--null-render\") == 0) {\n"
-                  "            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, \"dummy\");\n"
-                  "            break;\n"
-                  "        }\n"
-                  "    }\n\n"
                   "    void* appstate = nullptr;\n"
                   "    SDL_AppResult result = SDL_AppInit(&appstate, argc, argv);\n\n"
                   "    if (result != SDL_APP_CONTINUE || appstate == nullptr) {\n"
@@ -466,39 +515,7 @@ jobs:
               text += native_main
 
           path.write_text(text)
-          print("yuzu.cpp patched successfully with zero-null guarantees!")
-          PY
-
-          # --------------------------------------------------------
-          # 5.9 弹性修改 emu_window_sdl3.cpp (仅保留 VIDEO)
-          # --------------------------------------------------------
-          python3 <<'PY'
-          from pathlib import Path
-          import re
-
-          path = Path("src/yuzu_cmd/emu_window/emu_window_sdl3.cpp")
-          if not path.exists():
-              raise SystemExit("ERROR: emu_window_sdl3.cpp not found.")
-
-          text = path.read_text()
-          pattern = re.compile(
-              r'SDL_Init\s*\(\s*'
-              r'SDL_INIT_VIDEO\s*\|\s*'
-              r'SDL_INIT_JOYSTICK\s*\|\s*'
-              r'SDL_INIT_GAMEPAD\s*'
-              r'\)'
-          )
-          replacement = "SDL_Init(SDL_INIT_VIDEO)"
-
-          if pattern.search(text):
-              text = pattern.sub(replacement, text, count=1)
-              print("SDL_Init patched to VIDEO only.")
-          elif "SDL_Init(SDL_INIT_VIDEO)" in text:
-              print("SDL_Init already VIDEO only.")
-          else:
-              raise SystemExit("ERROR: Could not locate SDL_Init() call.")
-
-          path.write_text(text)
+          print("yuzu.cpp patched successfully with telemetry!")
           PY
 
           # --------------------------------------------------------
