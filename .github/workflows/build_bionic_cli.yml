@@ -72,7 +72,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (严格执行 GPT 原生 Bionic 方案，绝无假桩)
+      # 5. 精确源码重构 (严格缩进保护，纯净 Bionic 原生 CLI)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -169,7 +169,7 @@ jobs:
           done
 
           # --------------------------------------------------------
-          # 5.4 阻断 Android Input Engine 实例化 (彻底消灭 Vibration 线程)
+          # 5.4 阻断 Android Input Engine 实例化 (根除 Vibration 线程)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -193,7 +193,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.5 精确重构 yuzu.cpp (零假桩，仅改造生命周期与短参数)
+          # 5.5 精确重构 yuzu.cpp (零假桩，规范原生 main 生命周期)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -212,7 +212,7 @@ jobs:
                   1
               )
 
-          # 切换 SDL main 声明模式
+          # 切换 SDL main 宏
           pattern_sdl_main = re.compile(
               r'#define\s+SDL_MAIN_USE_CALLBACKS\s+1.*?\n\s*#include\s+<SDL3/SDL_main\.h>',
               re.MULTILINE
@@ -227,14 +227,14 @@ jobs:
           )
           text = pattern_sdl_main.sub(new_sdl_main, text, count=1)
 
-          # 修正 optstring：补充短参数 'n'
+          # 修正 optstring：增加短参数 'n'
           text = re.sub(
               r'getopt_long\s*\(\s*argc\s*,\s*argv\s*,\s*"[^"]*"',
               'getopt_long(argc, argv, "g:fhvnc:m:p::u:d:i:sx:"',
               text
           )
 
-          # 修正 long_options 潜在的参数属性缺失
+          # 修正 long_options 参数定义
           text = text.replace(
               '{"input-profile", no_argument, 0, \'i\'},',
               '{"input-profile", required_argument, 0, \'i\'},'
@@ -244,7 +244,7 @@ jobs:
               '{"filter", required_argument, 0, \'x\'},'
           )
 
-          # 修正 SDL_AppInit 保持主线程运行
+          # 修正 SDL_AppInit 保持主线程循环运行
           pattern_tail = re.compile(
               r'(void\s*\(\s*state->system\.Run\(\)\s*\)\s*;\s*\n\s*'
               r'if\s*\(\s*state->system\.DebuggerEnabled\(\)\s*\)\s*\n\s*'
@@ -283,59 +283,50 @@ jobs:
           )
           text = pattern_event.sub(new_event, text, count=1)
 
-          # 追加原生 main()
+          # 追加标准原生 main() (严格保持内部缩进，避免 YAML 解析中断)
           if "int main(int argc, char** argv)" not in text:
-              native_main = r'''
-#ifdef YUZU_BIONIC_CLI
-
-int main(int argc, char** argv) {
-    if (chdir("/data/eden") != 0) {
-        std::cerr << "Warning: unable to chdir to /data/eden" << std::endl;
-    }
-
-    SDL_SetMainReady();
-
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "-n") == 0 ||
-            std::strcmp(argv[i], "--null-render") == 0) {
-            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
-            break;
-        }
-    }
-
-    void* appstate = nullptr;
-    SDL_AppResult result = SDL_AppInit(&appstate, argc, argv);
-
-    if (result != SDL_APP_CONTINUE) {
-        if (appstate != nullptr) {
-            SDL_AppQuit(appstate, result);
-        }
-        return 0;
-    }
-
-    while (result == SDL_APP_CONTINUE) {
-        SDL_Event event{};
-        while (SDL_PollEvent(&event)) {
-            result = SDL_AppEvent(appstate, &event);
-            if (result != SDL_APP_CONTINUE) {
-                break;
-            }
-        }
-        if (result != SDL_APP_CONTINUE) {
-            break;
-        }
-        result = SDL_AppIterate(appstate);
-    }
-
-    if (appstate != nullptr) {
-        SDL_AppQuit(appstate, result);
-    }
-
-    return result == SDL_APP_SUCCESS ? 0 : 1;
-}
-
-#endif
-'''
+              native_main = (
+                  "\n#ifdef YUZU_BIONIC_CLI\n\n"
+                  "int main(int argc, char** argv) {\n"
+                  "    if (chdir(\"/data/eden\") != 0) {\n"
+                  "        std::cerr << \"Warning: unable to chdir to /data/eden\" << std::endl;\n"
+                  "    }\n\n"
+                  "    SDL_SetMainReady();\n\n"
+                  "    for (int i = 1; i < argc; ++i) {\n"
+                  "        if (std::strcmp(argv[i], \"-n\") == 0 ||\n"
+                  "            std::strcmp(argv[i], \"--null-render\") == 0) {\n"
+                  "            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, \"dummy\");\n"
+                  "            break;\n"
+                  "        }\n"
+                  "    }\n\n"
+                  "    void* appstate = nullptr;\n"
+                  "    SDL_AppResult result = SDL_AppInit(&appstate, argc, argv);\n\n"
+                  "    if (result != SDL_APP_CONTINUE) {\n"
+                  "        if (appstate != nullptr) {\n"
+                  "            SDL_AppQuit(appstate, result);\n"
+                  "        }\n"
+                  "        return 0;\n"
+                  "    }\n\n"
+                  "    while (result == SDL_APP_CONTINUE) {\n"
+                  "        SDL_Event event{};\n"
+                  "        while (SDL_PollEvent(&event)) {\n"
+                  "            result = SDL_AppEvent(appstate, &event);\n"
+                  "            if (result != SDL_APP_CONTINUE) {\n"
+                  "                break;\n"
+                  "            }\n"
+                  "        }\n"
+                  "        if (result != SDL_APP_CONTINUE) {\n"
+                  "            break;\n"
+                  "        }\n"
+                  "        result = SDL_AppIterate(appstate);\n"
+                  "    }\n\n"
+                  "    if (appstate != nullptr) {\n"
+                  "        SDL_AppQuit(appstate, result);\n"
+                  "    }\n\n"
+                  "    return result == SDL_APP_SUCCESS ? 0 : 1;\n"
+                  "}\n\n"
+                  "#endif\n"
+              )
               text += native_main
 
           path.write_text(text)
