@@ -24,7 +24,7 @@ jobs:
       - name: Install Host Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build ccache glslang-tools nasm libtool
+          sudo apt-get install -y cmake ninja-build ccache glslang-tools nasm libtool python3
 
       - name: Setup Android NDK
         id: setup-ndk
@@ -51,21 +51,29 @@ jobs:
             grep -q "#include <stop_token>" src/common/thread.h || sed -i '1i #include <stop_token>' src/common/thread.h
           fi
 
-          echo "=== 3. 修复 Android CLI 缺失 main 符号问题 (双保险补丁) ==="
-          # 3.1 在 yuzu.cpp 开头禁止 SDL 劫持 main
-          sed -i '1i #define SDL_MAIN_HANDLED 1' src/yuzu_cmd/yuzu.cpp
+          echo "=== 3. 根治 yuzu.cpp 中的 main 入口 ==="
+          python3 -c '
+          import re
 
-          # 3.2 在末尾追加弱符号 main 兜底桥接
-          cat << 'EOF' >> src/yuzu_cmd/yuzu.cpp
+          with open("src/yuzu_cmd/yuzu.cpp", "r") as f:
+              code = f.read()
 
-          #if defined(__ANDROID__)
-          #undef main
-          extern "C" int SDL_main(int argc, char* argv[]);
-          __attribute__((weak)) extern "C" int main(int argc, char* argv[]) {
-              return SDL_main(argc, argv);
-          }
-          #endif
-          EOF
+          # 移除先前测试中可能追加的 SDL_main 错误代码
+          code = re.sub(r"#if defined\(__ANDROID__\)[\s\S]*?#endif", "", code)
+
+          # 确保顶部定义 SDL_MAIN_HANDLED
+          if "#define SDL_MAIN_HANDLED" not in code:
+              code = "#define SDL_MAIN_HANDLED 1\n" + code
+
+          # 统一将 int SDL_main 或 int main 转为绝对纯净的 extern "C" int main
+          code = re.sub(r"int\s+SDL_main\s*\(", "extern \"C\" int main(", code)
+          code = re.sub(r"(int\s+main\s*\([^)]*\))", r"#undef main\nextern \"C\" \1", code)
+
+          with open("src/yuzu_cmd/yuzu.cpp", "w") as f:
+              f.write(code)
+
+          print("--- yuzu.cpp main 替换完成 ---")
+          '
 
       - name: Configure CMake
         run: |
@@ -97,7 +105,7 @@ jobs:
       - name: Compile Bionic Targets
         run: |
           cd build
-          # 直接完成最后的编译链接
+          # 执行完整编译链接
           ninja -j$(nproc)
 
       - name: Prepare Artifacts
@@ -105,17 +113,17 @@ jobs:
           NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
           rm -rf output_bin && mkdir -p output_bin
 
-          echo "=== 提取可执行二进制与运行库 ==="
-          # 1. 抓取生成的最终 CLI 执行程序
+          echo "=== 提取构建产物 ==="
+          # 提取最终生成的命令行可执行程序
           if [ -f "build/bin/yuzu-cmd" ]; then
             cp build/bin/yuzu-cmd output_bin/
           fi
           find build/bin -type f -exec cp {} output_bin/ \; 2>/dev/null || true
 
-          # 2. 抓取配对的 NDK libc++_shared.so
+          # 提取配套的 NDK C++ 运行时共享库
           cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" output_bin/ || true
 
-          echo "=== 打包产物确认 ==="
+          echo "=== 最终构建交付清单 ==="
           ls -lh output_bin/
 
       - name: Upload Bionic Binaries
