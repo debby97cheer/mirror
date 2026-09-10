@@ -74,7 +74,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (无头 EmuWindow + 进程遥测)
+      # 5. 精确源码重构 (严格单行字符串对齐，杜绝 YAML 缩进错误)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -253,8 +253,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 核心修复：改造 emu_window_sdl3.cpp 为纯无头模式
-          # 彻底跳过 SDL_Init(SDL_INIT_VIDEO) 与 SDL_CreateWindow
+          # 5.8 改造 emu_window_sdl3.cpp 为纯无头模式 (安全字符串替换)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -269,28 +268,29 @@ jobs:
           if "#include <iostream>" not in text:
               text = "#include <iostream>\n" + text
 
-          # 在 input_subsystem->Initialize() 之后立即切断物理窗口创建
           pattern = re.compile(r'(input_subsystem->Initialize\(\)\s*;\s*\n)')
-          injection = r'''\1#ifdef YUZU_BIONIC_CLI
-    std::cout << "[BIONIC] EmuWindow_SDL3: Headless CLI mode - bypassing physical SDL window & SurfaceFlinger" << std::endl;
-    is_open = true;
-    render_window = nullptr;
-    NotifyScreenLayoutChanged(Layout::DefaultFrameLayout(1280, 720));
-    return;
-#endif
-'''
+          injection = (
+              "\\1#ifdef YUZU_BIONIC_CLI\n"
+              "    std::cout << \"[BIONIC] EmuWindow_SDL3: Headless CLI mode - bypassing physical SDL window & SurfaceFlinger\" << std::endl;\n"
+              "    is_open = true;\n"
+              "    render_window = nullptr;\n"
+              "    NotifyScreenLayoutChanged(Layout::DefaultFrameLayout(1280, 720));\n"
+              "    return;\n"
+              "#endif\n"
+          )
           if pattern.search(text):
               text = pattern.sub(injection, text, count=1)
               print("EmuWindow_SDL3 successfully patched to Headless CLI mode!")
           else:
               raise SystemExit("ERROR: Could not find input_subsystem->Initialize() in emu_window_sdl3.cpp")
 
-          # 析构函数安全保护
           pattern_dtor = re.compile(r'EmuWindow_SDL3::~EmuWindow_SDL3\(\)\s*\{')
-          injection_dtor = """EmuWindow_SDL3::~EmuWindow_SDL3() {
-#ifdef YUZU_BIONIC_CLI
-    return;
-#endif"""
+          injection_dtor = (
+              "EmuWindow_SDL3::~EmuWindow_SDL3() {\n"
+              "#ifdef YUZU_BIONIC_CLI\n"
+              "    return;\n"
+              "#endif"
+          )
           text = pattern_dtor.sub(injection_dtor, text, count=1)
 
           path.write_text(text)
@@ -351,7 +351,6 @@ jobs:
               '{"filter", required_argument, 0, \'x\'},'
           )
 
-          # 插入执行遥测跟踪点
           text = text.replace(
               'state->system.Initialize();',
               'std::cout << "[BIONIC] Step 1: Initializing System Core..." << std::endl;\n    state->system.Initialize();\n    std::cout << "[BIONIC] Step 2: System Core Initialized. Creating InputSubsystem..." << std::endl;'
@@ -369,7 +368,6 @@ jobs:
               'std::cout << "[BIONIC] Step 6: Ready to Load ROM: " << filepath << std::endl;\n    const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, filepath, load_parameters);\n    std::cout << "[BIONIC] Step 7: Load completed with status: " << static_cast<int>(load_result) << std::endl;'
           )
 
-          # 赋值 *appstate = state
           pattern_tail = re.compile(
               r'(void\s*\(\s*state->system\.Run\(\)\s*\)\s*;\s*\n\s*'
               r'if\s*\(\s*state->system\.DebuggerEnabled\(\)\s*\)\s*\n\s*'
@@ -393,7 +391,6 @@ jobs:
           if pattern_tail.search(text):
               text = pattern_tail.sub(new_tail, text, count=1)
 
-          # 回调空指针防线
           old_callbacks = re.compile(
               r'extern\s+"C"\s+SDL_AppResult\s+SDL_AppIterate\s*\([^)]*\)\s*\{.*?'
               r'extern\s+"C"\s+void\s+SDL_AppQuit\s*\([^)]*\)\s*\{.*?delete\s+state\s*;\s*\}',
@@ -484,6 +481,13 @@ jobs:
                   "        std::cerr << \"Warning: unable to chdir to /data/eden\" << std::endl;\n"
                   "    }\n\n"
                   "    SDL_SetMainReady();\n\n"
+                  "    for (int i = 1; i < argc; ++i) {\n"
+                  "        if (std::strcmp(argv[i], \"-n\") == 0 ||\n"
+                  "            std::strcmp(argv[i], \"--null-render\") == 0) {\n"
+                  "            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, \"dummy\");\n"
+                  "            break;\n"
+                  "        }\n"
+                  "    }\n\n"
                   "    void* appstate = nullptr;\n"
                   "    SDL_AppResult result = SDL_AppInit(&appstate, argc, argv);\n\n"
                   "    if (result != SDL_APP_CONTINUE || appstate == nullptr) {\n"
