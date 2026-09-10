@@ -51,7 +51,7 @@ jobs:
             pkg-config
 
       # ============================================================
-      # 4. 配置 Android NDK r27c 并全局导出路径
+      # 4. 配置 Android NDK r27c
       # ============================================================
       - name: Setup Android NDK r27c
         id: setup-ndk
@@ -66,13 +66,13 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精准补丁 (注入 OpenSLES 空桩，根除动态库依赖)
+      # 5. 精准手术：剔除 OpenSLES、MediaNDK 与 JNI
       # ============================================================
-      - name: Patch Eden For Bionic CLI
+      - name: Patch Eden For Pure Native Runtime
         shell: bash
         run: |
           set -eux
-          echo "=== 1. 解除 YUZU_CMD 的 Android 平台限制 ==="
+          echo "=== 1. 解除 YUZU_CMD 的 Android 平台排他限制 ==="
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -95,7 +95,7 @@ jobs:
           path.write_text(text)
           PY
 
-          echo "=== 2. 排除 yuzu-android JNI 模块 ==="
+          echo "=== 2. 彻底移除 yuzu-android JNI 模块 ==="
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -118,14 +118,27 @@ jobs:
           path.write_text(text)
           PY
 
-          echo "=== 3. 补齐 <stop_token> ==="
+          echo "=== 3. 切断 mediandk 依赖 (改走 CPU 软解) ==="
+          python3 <<'PY'
+          from pathlib import Path
+
+          for cmake_file in Path("src").rglob("CMakeLists.txt"):
+              content = cmake_file.read_text()
+              if "mediandk" in content:
+                  print(f"Found mediandk in {cmake_file}, removing...")
+                  # 替换 target_link_libraries 里的 mediandk 为空
+                  content = content.replace("mediandk", "")
+                  cmake_file.write_text(content)
+          PY
+
+          echo "=== 4. 补齐 <stop_token> 头文件 ==="
           for f in src/common/thread_worker.h src/common/polyfill_thread.h src/common/thread.h; do
             if [ -f "$f" ] && ! grep -q '#include <stop_token>' "$f"; then
               sed -i '1i #include <stop_token>' "$f"
             fi
           done
 
-          echo "=== 4. 生成包含 OpenSLES 独立桩与实体的入口文件 ==="
+          echo "=== 5. 生成极简 Bionic ELF 入口包装层 ==="
           cat > src/yuzu_cmd/eden_bionic_entry.cpp <<'EOF'
           // SPDX-License-Identifier: GPL-3.0-or-later
           #define SDL_MAIN_HANDLED 1
@@ -133,7 +146,6 @@ jobs:
           #include <SDL3/SDL.h>
           #include <SDL3/SDL_main.h>
           #include <atomic>
-          #include <cstdint>
 
           #include "common/settings.h"
 
@@ -145,22 +157,6 @@ jobs:
           std::atomic<int> g_battery_percentage{100};
           std::atomic<bool> g_is_charging{false};
           std::atomic<bool> g_has_battery{true};
-
-          // ====================================================================
-          // 裸机 OpenSLES 空桩 (消除对系统 libOpenSLES.so 的动态依赖)
-          // ====================================================================
-          extern "C" {
-          const uint8_t SL_IID_ENGINE[16] = {0};
-          const uint8_t SL_IID_VOLUME[16] = {0};
-          const uint8_t SL_IID_ANDROIDSIMPLEBUFFERQUEUE[16] = {0};
-          const uint8_t SL_IID_RECORD[16] = {0};
-          const uint8_t SL_IID_PLAY[16] = {0};
-
-          // 返回非 0 告知 SDL3 音频后端初始化不启用 OpenSLES，安全跳过
-          int slCreateEngine(void*, int, const void*, int, const void*, const void*) {
-              return 1;
-          }
-          }
           #endif
 
           extern "C" SDL_AppResult SDLCALL SDL_AppInit(void** appstate, int argc, char** argv);
@@ -188,14 +184,14 @@ jobs:
               content = p.read_text()
               if "eden_bionic_entry.cpp" not in content:
                   content = content.replace("yuzu.cpp", "yuzu.cpp\n    eden_bionic_entry.cpp", 1)
-              # 仅链接必要的系统基础日志库，彻底移除 OpenSLES
+              # 仅链接基础日志库
               if "target_link_libraries(yuzu-cmd PRIVATE log)" not in content:
                   content += "\ntarget_link_libraries(yuzu-cmd PRIVATE log)\n"
               p.write_text(content)
           PY
 
       # ============================================================
-      # 6. 执行 CMake 配置 (完全剥离 -lOpenSLES)
+      # 6. 配置 CMake (全局彻底禁用 SDL 音频与 OpenSLES)
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -219,6 +215,9 @@ jobs:
             -DENABLE_QT=OFF \
             -DENABLE_QT_TRANSLATION=OFF \
             -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DSDL_AUDIO=OFF \
+            -DSDL_OPENSLES=OFF \
+            -DSDL_AAUDIO=OFF \
             -DENABLE_OPENGL=OFF \
             -DENABLE_CUBEB=OFF \
             -DENABLE_WEB_SERVICE=OFF \
@@ -261,23 +260,32 @@ jobs:
           fi
 
       # ============================================================
-      # 8. 校验 ELF 动态依赖 (必须确认不存在 libOpenSLES.so)
+      # 8. 严格校验 ELF 依赖项 (熔断机制)
       # ============================================================
-      - name: Verify Eden ARM64 ELF
+      - name: Verify Clean Bionic ELF
         shell: bash
         run: |
           set -eux
           BIN=$(find build/bin -maxdepth 1 -type f \( -name "eden-cli" -o -name "yuzu-cmd" \) | head -n 1)
 
-          echo "=== 检查动态链接依赖项 ==="
+          echo "============================================================"
+          echo "检查动态链接库依赖 (DT_NEEDED)"
+          echo "============================================================"
           readelf -d "$BIN"
 
-          # 强制断言：若仍存在 OpenSLES 依赖则中断
-          if readelf -d "$BIN" | grep -i opensles; then
-            echo "ERROR: libOpenSLES.so dependency still present!"
+          # 熔断检测：绝对不能有 OpenSLES
+          if readelf -d "$BIN" | grep -i "OpenSLES"; then
+            echo "CRITICAL ERROR: libOpenSLES.so still detected!"
             exit 1
           fi
-          echo "PASS: Binary is 100% free from libOpenSLES.so"
+
+          # 熔断检测：绝对不能有 mediandk
+          if readelf -d "$BIN" | grep -i "mediandk"; then
+            echo "CRITICAL ERROR: libmediandk.so still detected!"
+            exit 1
+          fi
+
+          echo "PASS: Binary is 100% free from OpenSLES and MediaNDK!"
 
       # ============================================================
       # 9. 打包交付物
@@ -298,7 +306,7 @@ jobs:
           tar -czf eden-bionic-arm64.tar.gz -C output_bin .
 
       # ============================================================
-      # 10. 上传构建成果
+      # 10. 上传构建产物
       # ============================================================
       - name: Upload Eden Bionic ARM64
         uses: actions/upload-artifact@v4
