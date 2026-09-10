@@ -154,7 +154,7 @@ jobs:
 
           #ifdef __ANDROID__
           namespace AndroidSettings {
-          Values values{};
+          Settings::Values values{};
           }
 
           // 补充 common/device_power_state.cpp 依赖的全局电池状态
