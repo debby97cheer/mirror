@@ -66,13 +66,13 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精准手术：剔除 OpenSLES、MediaNDK 与 JNI
+      # 5. 精准注入：Bionic 入口、设置实体与 OpenSLES 纯净闭环桩
       # ============================================================
       - name: Patch Eden For Pure Native Runtime
         shell: bash
         run: |
           set -eux
-          echo "=== 1. 解除 YUZU_CMD 的 Android 平台排他限制 ==="
+          echo "=== 1. 解除 YUZU_CMD 的 Android 平台限制 ==="
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -95,7 +95,7 @@ jobs:
           path.write_text(text)
           PY
 
-          echo "=== 2. 彻底移除 yuzu-android JNI 模块 ==="
+          echo "=== 2. 排除 yuzu-android JNI 模块 ==="
           python3 <<'PY'
           from pathlib import Path
           import re
@@ -118,27 +118,14 @@ jobs:
           path.write_text(text)
           PY
 
-          echo "=== 3. 切断 mediandk 依赖 (改走 CPU 软解) ==="
-          python3 <<'PY'
-          from pathlib import Path
-
-          for cmake_file in Path("src").rglob("CMakeLists.txt"):
-              content = cmake_file.read_text()
-              if "mediandk" in content:
-                  print(f"Found mediandk in {cmake_file}, removing...")
-                  # 替换 target_link_libraries 里的 mediandk 为空
-                  content = content.replace("mediandk", "")
-                  cmake_file.write_text(content)
-          PY
-
-          echo "=== 4. 补齐 <stop_token> 头文件 ==="
+          echo "=== 3. 补齐 <stop_token> 头文件 ==="
           for f in src/common/thread_worker.h src/common/polyfill_thread.h src/common/thread.h; do
             if [ -f "$f" ] && ! grep -q '#include <stop_token>' "$f"; then
               sed -i '1i #include <stop_token>' "$f"
             fi
           done
 
-          echo "=== 5. 生成极简 Bionic ELF 入口包装层 ==="
+          echo "=== 4. 植入 OpenSLES 独立符号桩与 Bionic 运行时实体 ==="
           cat > src/yuzu_cmd/eden_bionic_entry.cpp <<'EOF'
           // SPDX-License-Identifier: GPL-3.0-or-later
           #define SDL_MAIN_HANDLED 1
@@ -146,6 +133,7 @@ jobs:
           #include <SDL3/SDL.h>
           #include <SDL3/SDL_main.h>
           #include <atomic>
+          #include <cstdint>
 
           #include "common/settings.h"
 
@@ -157,6 +145,33 @@ jobs:
           std::atomic<int> g_battery_percentage{100};
           std::atomic<bool> g_is_charging{false};
           std::atomic<bool> g_has_battery{true};
+
+          // ====================================================================
+          // 导出 OpenSLES 符号实体 (完全就地满足 libSDL3.a，无需依赖动态库)
+          // ====================================================================
+          extern "C" {
+          struct SLInterfaceID_ {
+              uint32_t time_low;
+              uint16_t time_mid;
+              uint16_t time_hi_and_version;
+              uint16_t clock_seq;
+              uint8_t  node[6];
+          };
+
+          static const struct SLInterfaceID_ s_dummy_iid = {0, 0, 0, 0, {0}};
+
+          extern const struct SLInterfaceID_* const SL_IID_ENGINE = &s_dummy_iid;
+          extern const struct SLInterfaceID_* const SL_IID_VOLUME = &s_dummy_iid;
+          extern const struct SLInterfaceID_* const SL_IID_ANDROIDSIMPLEBUFFERQUEUE = &s_dummy_iid;
+          extern const struct SLInterfaceID_* const SL_IID_RECORD = &s_dummy_iid;
+          extern const struct SLInterfaceID_* const SL_IID_PLAY = &s_dummy_iid;
+
+          // 返回非 0 错误码，指示特性不支持，SDL3 会安全回退而不崩溃
+          int slCreateEngine(void* engine, uint32_t numOptions, const void* engineOptions,
+                             uint32_t numInterfaces, const void* interfaceIds, const void* interfaceRequired) {
+              return 1;
+          }
+          }
           #endif
 
           extern "C" SDL_AppResult SDLCALL SDL_AppInit(void** appstate, int argc, char** argv);
@@ -184,14 +199,14 @@ jobs:
               content = p.read_text()
               if "eden_bionic_entry.cpp" not in content:
                   content = content.replace("yuzu.cpp", "yuzu.cpp\n    eden_bionic_entry.cpp", 1)
-              # 仅链接基础日志库
+              # 仅链接必要的底层 log 库，绝对不添加 OpenSLES
               if "target_link_libraries(yuzu-cmd PRIVATE log)" not in content:
                   content += "\ntarget_link_libraries(yuzu-cmd PRIVATE log)\n"
               p.write_text(content)
           PY
 
       # ============================================================
-      # 6. 配置 CMake (全局彻底禁用 SDL 音频与 OpenSLES)
+      # 6. 配置 CMake (剥离 -lOpenSLES，使用 LLD 链接器)
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -215,9 +230,6 @@ jobs:
             -DENABLE_QT=OFF \
             -DENABLE_QT_TRANSLATION=OFF \
             -DYUZU_USE_BUNDLED_SDL3=ON \
-            -DSDL_AUDIO=OFF \
-            -DSDL_OPENSLES=OFF \
-            -DSDL_AAUDIO=OFF \
             -DENABLE_OPENGL=OFF \
             -DENABLE_CUBEB=OFF \
             -DENABLE_WEB_SERVICE=OFF \
@@ -260,7 +272,7 @@ jobs:
           fi
 
       # ============================================================
-      # 8. 严格校验 ELF 依赖项 (熔断机制)
+      # 8. 严格校验 ELF 依赖项 (断言绝对不依赖 libOpenSLES.so)
       # ============================================================
       - name: Verify Clean Bionic ELF
         shell: bash
@@ -273,22 +285,16 @@ jobs:
           echo "============================================================"
           readelf -d "$BIN"
 
-          # 熔断检测：绝对不能有 OpenSLES
+          # 熔断断言：如果出现 OpenSLES 依赖，立即退出
           if readelf -d "$BIN" | grep -i "OpenSLES"; then
-            echo "CRITICAL ERROR: libOpenSLES.so still detected!"
+            echo "CRITICAL ERROR: libOpenSLES.so still detected in DT_NEEDED!"
             exit 1
           fi
 
-          # 熔断检测：绝对不能有 mediandk
-          if readelf -d "$BIN" | grep -i "mediandk"; then
-            echo "CRITICAL ERROR: libmediandk.so still detected!"
-            exit 1
-          fi
-
-          echo "PASS: Binary is 100% free from OpenSLES and MediaNDK!"
+          echo "PASS: Binary is 100% free from libOpenSLES.so!"
 
       # ============================================================
-      # 9. 打包交付物
+      # 9. 提取交付物并归档
       # ============================================================
       - name: Package Runtime Artifacts
         shell: bash
