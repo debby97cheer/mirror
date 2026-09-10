@@ -66,7 +66,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精准注入：Bionic 入口、设置实体与 ANativeWindow/OpenSLES 纯净闭环桩
+      # 5. 精准注入：Bionic 入口、设置实体与全套 NDK 独立闭环桩
       # ============================================================
       - name: Patch Eden For Pure Native Runtime
         shell: bash
@@ -125,7 +125,7 @@ jobs:
             fi
           done
 
-          echo "=== 4. 植入纯净闭环桩 (消除 libOpenSLES.so 与 libandroid.so) ==="
+          echo "=== 4. 植入全套闭环桩 (消除 libOpenSLES.so 与 libandroid.so) ==="
           cat > src/yuzu_cmd/eden_bionic_entry.cpp <<'EOF'
           // SPDX-License-Identifier: GPL-3.0-or-later
           #define SDL_MAIN_HANDLED 1
@@ -134,6 +134,8 @@ jobs:
           #include <SDL3/SDL_main.h>
           #include <atomic>
           #include <cstdint>
+          #include <cstddef>
+          #include <sys/types.h>
 
           #include "common/settings.h"
 
@@ -146,10 +148,10 @@ jobs:
           std::atomic<bool> g_is_charging{false};
           std::atomic<bool> g_has_battery{true};
 
-          // ====================================================================
-          // 1. OpenSLES 独立闭环桩 (彻底断绝 libOpenSLES.so 动态依赖)
-          // ====================================================================
           extern "C" {
+          // ====================================================================
+          // 1. OpenSLES 独立闭环桩 (消除 libOpenSLES.so)
+          // ====================================================================
           struct SLInterfaceID_ {
               uint32_t time_low;
               uint16_t time_mid;
@@ -171,7 +173,7 @@ jobs:
           }
 
           // ====================================================================
-          // 2. ANativeWindow 独立闭环桩 (断绝 libandroid.so -> libgui.so 依赖)
+          // 2. ANativeWindow 独立闭环桩
           // ====================================================================
           int32_t ANativeWindow_setBuffersGeometry(void*, int32_t, int32_t, int32_t) { return 0; }
           int32_t ANativeWindow_getWidth(void*) { return 1800; }
@@ -182,6 +184,38 @@ jobs:
           void ANativeWindow_release(void*) {}
           int32_t ANativeWindow_lock(void*, void*, void*) { return -1; }
           int32_t ANativeWindow_unlockAndPost(void*) { return 0; }
+
+          // ====================================================================
+          // 3. Android Sensor / Looper 独立闭环桩 (消解 SDL_androidsensor 依赖)
+          // ====================================================================
+          void* ASensorManager_getInstance() { return nullptr; }
+          void* ASensorManager_getInstanceForPackage(const char*) { return nullptr; }
+          int ASensorManager_getSensorList(void*, void*) { return 0; }
+          const char* ASensor_getName(void*) { return ""; }
+          int ASensor_getType(void*) { return -1; }
+          int ASensor_getMinDelay(void*) { return 0; }
+          void* ASensorManager_createEventQueue(void*, void*, int, void*, void*) { return nullptr; }
+          int ASensorManager_destroyEventQueue(void*, void*) { return 0; }
+          int ASensorEventQueue_enableSensor(void*, void*) { return -1; }
+          int ASensorEventQueue_disableSensor(void*, void*) { return 0; }
+          int ASensorEventQueue_setEventRate(void*, void*, int32_t) { return 0; }
+          ssize_t ASensorEventQueue_getEvents(void*, void*, size_t) { return 0; }
+
+          void* ALooper_prepare(int) { return nullptr; }
+          int ALooper_pollOnce(int, int*, int*, void**) { return -1; }
+          void ALooper_wake(void*) {}
+          void ALooper_acquire(void*) {}
+          void ALooper_release(void*) {}
+
+          // ====================================================================
+          // 4. Android Asset 独立闭环桩 (消解 SDL_android 内部 APK 文件读取)
+          // ====================================================================
+          void* AAssetManager_fromJava(void*, void*) { return nullptr; }
+          void* AAssetManager_open(void*, const char*, int) { return nullptr; }
+          int AAsset_read(void*, void*, size_t) { return 0; }
+          int64_t AAsset_seek64(void*, int64_t, int) { return -1; }
+          int64_t AAsset_getLength64(void*) { return 0; }
+          void AAsset_close(void*) {}
           }
           #endif
 
@@ -210,14 +244,13 @@ jobs:
               content = p.read_text()
               if "eden_bionic_entry.cpp" not in content:
                   content = content.replace("yuzu.cpp", "yuzu.cpp\n    eden_bionic_entry.cpp", 1)
-              # 仅链接必要的底层基础日志库
               if "target_link_libraries(yuzu-cmd PRIVATE log)" not in content:
                   content += "\ntarget_link_libraries(yuzu-cmd PRIVATE log)\n"
               p.write_text(content)
           PY
 
       # ============================================================
-      # 6. 配置 CMake (完整标准生成 build.ninja)
+      # 6. 配置 CMake
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -259,19 +292,16 @@ jobs:
             -DCMAKE_C_FLAGS="-fexperimental-library"
 
       # ============================================================
-      # 7. 从 Ninja 链接规则中精准抹除外部框架依赖
+      # 7. 从 Ninja 链接规则中剥离外部框架库
       # ============================================================
       - name: Strip Framework Linker Flags From Ninja
         shell: bash
         run: |
           set -eux
-          echo "=== 清洗 build.ninja 最终 ELF 的链接参数 ==="
-          # 抹除 libmediandk 绝对路径及 -lmediandk
+          echo "=== 清除 build.ninja 中多余的外部系统库链接 ==="
           sed -i -E 's|[^ ]*libmediandk\.so||g' build/build.ninja
           sed -i -E 's|-lmediandk\b||g' build/build.ninja
-          # 抹除 -landroid (已由桩就地实现，避免拉起 libgui.so)
           sed -i -E 's|-landroid\b||g' build/build.ninja
-          # 抹除 -lOpenSLES
           sed -i -E 's|-lOpenSLES\b||g' build/build.ninja
 
       # ============================================================
@@ -299,7 +329,7 @@ jobs:
           fi
 
       # ============================================================
-      # 9. 校验依赖纯净度
+      # 9. 校验依赖纯净度 (绝对不包含任何框架动态库)
       # ============================================================
       - name: Verify Clean Bionic ELF
         shell: bash
@@ -312,7 +342,7 @@ jobs:
           echo "============================================================"
           readelf -d "$BIN"
 
-          # 确保没有残留任何 Android Framework 库
+          # 熔断断言：严禁包含任何框架库
           for BANNED in OpenSLES mediandk android.so gui.so; do
             if readelf -d "$BIN" | grep -i "$BANNED"; then
               echo "CRITICAL ERROR: Banned library $BANNED still detected!"
@@ -323,7 +353,7 @@ jobs:
           echo "PASS: Binary is 100% PURE Native Bionic ELF!"
 
       # ============================================================
-      # 10. 提取交付物并打包归档
+      # 10. 打包交付物
       # ============================================================
       - name: Package Runtime Artifacts
         shell: bash
