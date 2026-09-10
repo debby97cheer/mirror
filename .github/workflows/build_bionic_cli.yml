@@ -1,0 +1,83 @@
+name: Build Eden Bionic Native CLI (ARM64)
+
+on:
+  workflow_dispatch: # 支持网页端一键手动触发
+
+jobs:
+  build-android-bionic:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/*
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          df -h
+
+      - name: Checkout Source with Submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Host Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache glslang-tools nasm
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+          add-to-path: true
+
+      - name: Patch CMake for Bionic CLI Build
+        run: |
+          echo "[*] 解除 yuzu_cmd 的 NOT ANDROID 限制..."
+          # 允许在 Android 环境下构建 yuzu_cmd 目标
+          sed -i 's/if (NOT ANDROID)/if (TRUE)/g' CMakeLists.txt || true
+          sed -i 's/if (NOT ANDROID)/if (TRUE)/g' src/CMakeLists.txt || true
+
+      - name: Configure CMake (Android Bionic NCE)
+        run: |
+          mkdir build && cd build
+          cmake .. \
+            -GNinja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-34 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_QT=OFF \
+            -DENABLE_SDL2=OFF \
+            -DENABLE_NCE=ON \
+            -DYUZU_USE_BUNDLED_VCPKG=OFF \
+            -DENABLE_COMPATIBILITY_LIST_DOWNLOAD=OFF \
+            -DYUZU_ENABLE_LTO=OFF \
+            -DYUZU_TESTS=OFF \
+            -DCMAKE_C_FLAGS="-fuse-ld=lld" \
+            -DCMAKE_CXX_FLAGS="-fuse-ld=lld"
+
+      - name: Compile Bionic Targets
+        run: |
+          cd build
+          # 优先编译 core 与 yuzu-cmd 基础库
+          ninja -j$(nproc) yuzu-cmd || ninja -j$(nproc)
+
+      - name: Prepare Artifacts
+        run: |
+          mkdir -p dist/
+          # 收集生成的可执行文件与 C++ 共享运行库
+          find build/bin -type f -exec cp {} dist/ \; 2>/dev/null || true
+          find build -name "yuzu-cmd" -exec cp {} dist/ \; 2>/dev/null || true
+          find build -name "eden-cli" -exec cp {} dist/ \; 2>/dev/null || true
+          cp $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so dist/
+          ls -lh dist/
+
+      - name: Upload Bionic Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-bionic-arm64
+          path: dist/
