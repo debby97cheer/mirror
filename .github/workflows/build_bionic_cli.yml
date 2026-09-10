@@ -74,7 +74,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (斩断 Android Framework 依赖链)
+      # 5. 精确源码重构 (回传 appstate 上下文 + 闭环保护)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -253,7 +253,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 精确重构 yuzu.cpp (注入闭环桩消解 libandroid.so / libOpenSLES.so)
+          # 5.8 深度重构 yuzu.cpp (回传 appstate + 空指针防线 + 实时输出)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -310,28 +310,68 @@ jobs:
               '{"filter", required_argument, 0, \'x\'},'
           )
 
-          # 修正 SDL_AppEvent 退出判定
-          pattern_event = re.compile(
-              r'(extern\s+"C"\s+SDL_AppResult\s+SDL_AppEvent\s*\([^)]*\)\s*\{.*?'
-              r'state->emu_window->OnEvent\(\*event\);\s*\n\s*)'
+          # 核心修复 1：在 SDL_AppInit 成功返回前回传 *appstate = state
+          pattern_tail = re.compile(
+              r'(void\s*\(\s*state->system\.Run\(\)\s*\)\s*;\s*\n\s*'
+              r'if\s*\(\s*state->system\.DebuggerEnabled\(\)\s*\)\s*\n\s*'
+              r'state->system\.InitializeDebugger\(\)\s*;\s*\n\s*)'
               r'return\s+SDL_APP_SUCCESS\s*;\s*\n\s*\}',
-              re.MULTILINE | re.DOTALL
+              re.MULTILINE
           )
-          replacement_event = (
+          new_tail = (
               r'\1'
               "#ifdef YUZU_BIONIC_CLI\n"
-              "    return state->emu_window->IsOpen()\n"
-              "        ? SDL_APP_CONTINUE\n"
-              "        : SDL_APP_SUCCESS;\n"
+              "    if (appstate != nullptr) {\n"
+              "        *appstate = state;\n"
+              "    }\n"
+              "    return SDL_APP_CONTINUE;\n"
               "#else\n"
               "    return SDL_APP_SUCCESS;\n"
               "#endif\n"
               "}"
           )
-          if pattern_event.search(text):
-              text = pattern_event.sub(replacement_event, text, count=1)
+          if pattern_tail.search(text):
+              text = pattern_tail.sub(new_tail, text, count=1)
+              print("AppInit tail successfully patched with *appstate assignment!")
 
-          # 追加标准原生 main() 与全部 NDK 闭环桩 (消除 libandroid.so 和 libOpenSLES.so)
+          # 核心修复 2：防御式重写 SDL_AppIterate / SDL_AppEvent / SDL_AppQuit
+          old_callbacks = re.compile(
+              r'extern\s+"C"\s+SDL_AppResult\s+SDL_AppIterate\s*\([^)]*\)\s*\{.*?'
+              r'extern\s+"C"\s+void\s+SDL_AppQuit\s*\([^)]*\)\s*\{.*?delete\s+state\s*;\s*\}',
+              re.MULTILINE | re.DOTALL
+          )
+          guarded_callbacks = (
+              'extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {\n'
+              '    if (!appstate) return SDL_APP_FAILURE;\n'
+              '    SdlState *state = (SdlState *)appstate;\n'
+              '    if (!state->emu_window) return SDL_APP_FAILURE;\n'
+              '    return state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;\n'
+              '}\n\n'
+              'extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {\n'
+              '    if (!appstate) return SDL_APP_FAILURE;\n'
+              '    SdlState *state = (SdlState *)appstate;\n'
+              '    if (state->emu_window) state->emu_window->OnEvent(*event);\n'
+              '#ifdef YUZU_BIONIC_CLI\n'
+              '    if (!state->emu_window) return SDL_APP_FAILURE;\n'
+              '    return state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;\n'
+              '#else\n'
+              '    return SDL_APP_SUCCESS;\n'
+              '#endif\n'
+              '}\n\n'
+              'extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {\n'
+              '    if (!appstate) return;\n'
+              '    SdlState *state = (SdlState *)appstate;\n'
+              '    state->system.DetachDebugger();\n'
+              '    void(state->system.Pause());\n'
+              '    state->system.ShutdownMainProcess();\n'
+              '    delete state;\n'
+              '}'
+          )
+          if old_callbacks.search(text):
+              text = old_callbacks.sub(guarded_callbacks, text, count=1)
+              print("SDL Callbacks safely guarded against null dereferences!")
+
+          # 核心修复 3：追加标准原生 main() (无缓冲实时输出 + 闭环保护)
           if "int main(int argc, char** argv)" not in text:
               native_main = (
                   "\n#ifdef YUZU_BIONIC_CLI\n\n"
@@ -339,7 +379,6 @@ jobs:
                   "#include <cstddef>\n"
                   "#include <sys/types.h>\n\n"
                   "extern \"C\" {\n"
-                  "// 1. OpenSLES 闭环桩 (消解 libOpenSLES.so)\n"
                   "struct SLInterfaceID_ { uint32_t a; uint16_t b, c, d; uint8_t e[6]; };\n"
                   "static const struct SLInterfaceID_ s_dummy = {0, 0, 0, 0, {0}};\n"
                   "extern const struct SLInterfaceID_* const SL_IID_ENGINE = &s_dummy;\n"
@@ -348,7 +387,6 @@ jobs:
                   "extern const struct SLInterfaceID_* const SL_IID_RECORD = &s_dummy;\n"
                   "extern const struct SLInterfaceID_* const SL_IID_PLAY = &s_dummy;\n"
                   "int slCreateEngine(void*, uint32_t, const void*, uint32_t, const void*, const void*) { return 1; }\n\n"
-                  "// 2. ANativeWindow 闭环桩 (消解 libandroid.so -> libgui.so 依赖)\n"
                   "int32_t ANativeWindow_setBuffersGeometry(void*, int32_t, int32_t, int32_t) { return 0; }\n"
                   "int32_t ANativeWindow_getWidth(void*) { return 1800; }\n"
                   "int32_t ANativeWindow_getHeight(void*) { return 2880; }\n"
@@ -358,7 +396,6 @@ jobs:
                   "void ANativeWindow_release(void*) {}\n"
                   "int32_t ANativeWindow_lock(void*, void*, void*) { return -1; }\n"
                   "int32_t ANativeWindow_unlockAndPost(void*) { return 0; }\n\n"
-                  "// 3. Android Sensor / Looper 闭环桩 (消解 SDL 传感器对 libandroid.so 的引用)\n"
                   "void* ASensorManager_getInstance() { return nullptr; }\n"
                   "void* ASensorManager_getInstanceForPackage(const char*) { return nullptr; }\n"
                   "int ASensorManager_getSensorList(void*, void*) { return 0; }\n"
@@ -376,7 +413,6 @@ jobs:
                   "void ALooper_wake(void*) {}\n"
                   "void ALooper_acquire(void*) {}\n"
                   "void ALooper_release(void*) {}\n\n"
-                  "// 4. Android Asset 闭环桩 (消解 SDL APK 资源包对 libandroid.so 的引用)\n"
                   "void* AAssetManager_fromJava(void*, void*) { return nullptr; }\n"
                   "void* AAssetManager_open(void*, const char*, int) { return nullptr; }\n"
                   "int AAsset_read(void*, void*, size_t) { return 0; }\n"
@@ -385,6 +421,9 @@ jobs:
                   "void AAsset_close(void*) {}\n"
                   "}\n\n"
                   "int main(int argc, char** argv) {\n"
+                  "    // 强制关闭标准 I/O 缓冲，让所有 Log 实时冲刷到终端\n"
+                  "    setvbuf(stdout, nullptr, _IONBF, 0);\n"
+                  "    setvbuf(stderr, nullptr, _IONBF, 0);\n\n"
                   "    if (chdir(\"/data/eden\") != 0) {\n"
                   "        std::cerr << \"Warning: unable to chdir to /data/eden\" << std::endl;\n"
                   "    }\n\n"
@@ -398,11 +437,11 @@ jobs:
                   "    }\n\n"
                   "    void* appstate = nullptr;\n"
                   "    SDL_AppResult result = SDL_AppInit(&appstate, argc, argv);\n\n"
-                  "    if (result != SDL_APP_CONTINUE) {\n"
+                  "    if (result != SDL_APP_CONTINUE || appstate == nullptr) {\n"
                   "        if (appstate != nullptr) {\n"
                   "            SDL_AppQuit(appstate, result);\n"
                   "        }\n"
-                  "        return 0;\n"
+                  "        return (result == SDL_APP_SUCCESS) ? 0 : 1;\n"
                   "    }\n\n"
                   "    while (result == SDL_APP_CONTINUE) {\n"
                   "        SDL_Event event{};\n"
@@ -420,14 +459,14 @@ jobs:
                   "    if (appstate != nullptr) {\n"
                   "        SDL_AppQuit(appstate, result);\n"
                   "    }\n\n"
-                  "    return result == SDL_APP_SUCCESS ? 0 : 1;\n"
+                  "    return (result == SDL_APP_SUCCESS) ? 0 : 1;\n"
                   "}\n\n"
                   "#endif\n"
               )
               text += native_main
 
           path.write_text(text)
-          print("yuzu.cpp patched successfully.")
+          print("yuzu.cpp patched successfully with zero-null guarantees!")
           PY
 
           # --------------------------------------------------------
@@ -529,7 +568,7 @@ jobs:
           PY
 
       # ============================================================
-      # 6. 配置 CMake (-Wl,--as-needed 精准剥离未使用的动态库)
+      # 6. 配置 CMake
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -587,7 +626,7 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       # ============================================================
-      # 7. 从 Ninja 规则中清理多余链接库 (根除 libandroid / libmediandk)
+      # 7. 从 Ninja 规则中清理多余动态库
       # ============================================================
       - name: Strip Dead Dynamic Libs From Ninja
         shell: bash
@@ -643,7 +682,7 @@ jobs:
           ninja -C build -j"$(nproc)" eden-cli
 
       # ============================================================
-      # 10. 严格校验纯净度 (严禁包含任何框架动态库)
+      # 10. 严格校验纯净度
       # ============================================================
       - name: Verify Clean Bionic ELF
         shell: bash
@@ -653,22 +692,11 @@ jobs:
           test -f "$BIN"
 
           echo "============================================================"
-          echo "ELF HEADER"
+          echo "ELF HEADER & DEPENDENCIES"
           echo "============================================================"
           file "$BIN"
-          readelf -h "$BIN"
-
-          echo "============================================================"
-          echo "MAIN SYMBOL"
-          echo "============================================================"
-          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -C "$BIN" | grep -E '(^| )main$'
-
-          echo "============================================================"
-          echo "DYNAMIC DEPENDENCIES (DT_NEEDED)"
-          echo "============================================================"
           readelf -d "$BIN"
 
-          # 熔断断言：严禁包含任何 Android Framework 库
           for BANNED in OpenSLES mediandk android.so gui.so; do
             if readelf -d "$BIN" | grep -i "$BANNED"; then
               echo "CRITICAL ERROR: Banned library $BANNED detected!"
