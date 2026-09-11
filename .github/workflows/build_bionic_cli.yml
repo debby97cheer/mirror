@@ -44,70 +44,175 @@ jobs:
 
       - name: Patch YUZU_CMD & YUZU_BIONIC_CLI option
         run: |
-          python3 -c "
-          import pathlib, re
-          p_root = pathlib.Path('CMakeLists.txt')
-          text = p_root.read_text()
-          text = re.sub(r'cmake_dependent_option\s*\(\s*YUZU_CMD[^\)]*?\)', 'option(YUZU_CMD \"Compile CLI\" ON)', text, flags=re.MULTILINE|re.DOTALL)
-          if 'YUZU_BIONIC_CLI' not in text:
-              text = text.replace('option(YUZU_CMD \"Compile CLI\" ON)',
-                                  'option(YUZU_CMD \"Compile CLI\" ON)\noption(YUZU_BIONIC_CLI \"Build standalone Android/Bionic CLI\" ON)\nif (YUZU_BIONIC_CLI)\n    add_compile_definitions(YUZU_BIONIC_CLI)\nendif()')
-          p_root.write_text(text)
+          sed -i 's/cmake_dependent_option(YUZU_CMD "Compile the yuzu-cmd executable" OFF "NOT ANDROID" OFF)/option(YUZU_CMD "Compile the eden-cli executable" ON)/g' CMakeLists.txt || true
+          sed -i 's/cmake_dependent_option(YUZU_CMD "Compile the eden-cli executable" OFF "NOT ANDROID" OFF)/option(YUZU_CMD "Compile the eden-cli executable" ON)/g' CMakeLists.txt || true
+          sed -i '/option(YUZU_CMD/a option(YUZU_BIONIC_CLI "Build standalone Android/Bionic CLI" OFF)\nif (YUZU_BIONIC_CLI)\nadd_compile_definitions(YUZU_BIONIC_CLI)\nendif()' CMakeLists.txt
 
-          p_src = pathlib.Path('src/CMakeLists.txt')
-          text = p_src.read_text()
-          text = re.sub(r'if\s*\(\s*YUZU_CMD\s*\)', 'if (YUZU_CMD OR YUZU_BIONIC_CLI)', text, count=1)
-          text = re.sub(r'if\s*\(\s*ANDROID\s*\)\s*\n\s*add_subdirectory\(\s*android/app/src/main/jni\s*\)',
-                        'if (ANDROID AND NOT YUZU_BIONIC_CLI)\n    add_subdirectory(android/app/src/main/jni)', text, count=1)
-          p_src.write_text(text)
-          "
-
-      - name: Clean Architecture Dependencies & Fix C++20 stop_token
+      - name: Setup Headless Window & Architecture Decoupling
+        shell: bash
         run: |
-          python3 -c "
-          import pathlib, re
+          set -eux
 
-          def safe_patch(filepath, pattern, replacement):
-              p = pathlib.Path(filepath)
-              if p.exists():
-                  text = p.read_text()
-                  patched = re.sub(pattern, replacement, text, flags=re.MULTILINE)
-                  p.write_text(patched)
+          python3 <<'PY'
+          from pathlib import Path
+          import re
 
-          safe_patch('src/core/CMakeLists.txt', r'target_link_libraries\(\s*core\s+PRIVATE\s+mediandk\s*\)', '')
-          
-          p_input = pathlib.Path('src/input_common/CMakeLists.txt')
+          # ========================================================
+          # 1. 彻底改造 Null Window (纯净、无假桩、无隐藏逻辑)
+          # ========================================================
+          p_null = Path("src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp")
+          p_null.write_text(
+              "// SPDX-FileCopyrightText: 2026 Eden Emulator Project\n"
+              "// SPDX-License-Identifier: GPL-3.0-or-later\n\n"
+              "#include <iostream>\n"
+              "#include <memory>\n\n"
+              "#include \"yuzu_cmd/emu_window/emu_window_sdl3_null.h\"\n\n"
+              "EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(\n"
+              "    InputCommon::InputSubsystem* input_subsystem,\n"
+              "    Core::System& system,\n"
+              "    bool fullscreen)\n"
+              "    : EmuWindow_SDL3{input_subsystem, system} {\n"
+              "    (void)fullscreen;\n"
+              "    is_open = true;\n"
+              "    std::cout << \"[BIONIC] EmuWindow_SDL3_Null: initialized\" << std::endl;\n"
+              "}\n\n"
+              "EmuWindow_SDL3_Null::~EmuWindow_SDL3_Null() = default;\n\n"
+              "std::unique_ptr<Core::Frontend::GraphicsContext>\n"
+              "EmuWindow_SDL3_Null::CreateSharedContext() const {\n"
+              "    return std::make_unique<DummyContext>();\n"
+              "}\n"
+          )
+          print("Null EmuWindow written cleanly.")
+
+          # ========================================================
+          # 2. 安全重构 Base SDL3 Window (彻底抛弃危险的正则表达式反向引用)
+          # ========================================================
+          p_base = Path("src/yuzu_cmd/emu_window/emu_window_sdl3.cpp")
+          if p_base.exists():
+              text = p_base.read_text()
+              if "#include <iostream>" not in text:
+                  text = "#include <iostream>\n" + text
+
+              pattern = re.compile(r'input_subsystem->Initialize\(\)\s*;\s*\n')
+              if "#ifdef YUZU_BIONIC_CLI" not in text:
+                  match = pattern.search(text)
+                  if not match:
+                      raise SystemExit("ERROR: could not find input_subsystem->Initialize() in emu_window_sdl3.cpp")
+                  
+                  # 使用安全的字符串切片与连接，绝不产生控制字符 0x01
+                  replacement = (
+                      match.group(0)
+                      + "#ifdef YUZU_BIONIC_CLI\n"
+                      + "    std::cout << \"[BIONIC] Headless mode - no physical window\" << std::endl;\n"
+                      + "    is_open = true;\n"
+                      + "    render_window = nullptr;\n"
+                      + "    return;\n"
+                      + "#endif\n"
+                  )
+                  text = text[:match.start()] + replacement + text[match.end():]
+              
+              # 保护析构函数
+              text = text.replace('EmuWindow_SDL3::~EmuWindow_SDL3() {', 'EmuWindow_SDL3::~EmuWindow_SDL3() {\n    if (!render_window) return;')
+              p_base.write_text(text)
+              print("Base SDL3 window patched safely.")
+
+          # ========================================================
+          # 3. yuzu.cpp 加入链路阶段日志遥测
+          # ========================================================
+          p_yuzu = Path('src/yuzu_cmd/yuzu.cpp')
+          if p_yuzu.exists():
+              yuzu_text = p_yuzu.read_text()
+              yuzu_text = yuzu_text.replace('state->system.Initialize();', 'std::cout << \"[BIONIC] Step 1: Init System Core...\" << std::endl;\n    state->system.Initialize();')
+              yuzu_text = yuzu_text.replace('state->system.ApplySettings();', 'std::cout << \"[BIONIC] Step 2: Settings Applied...\" << std::endl;\n    state->system.ApplySettings();')
+              yuzu_text = yuzu_text.replace('state->system.SetContentProvider', 'std::cout << \"[BIONIC] Step 3: Filesystem Ready!\" << std::endl;\n    state->system.SetContentProvider')
+              yuzu_text = yuzu_text.replace('const Core::SystemResultStatus load_result = state->system.Load(', 'std::cout << \"[BIONIC] Step 4: Loading Target ROM...\" << std::endl;\n    const Core::SystemResultStatus load_result = state->system.Load(')
+              p_yuzu.write_text(yuzu_text)
+
+          # ========================================================
+          # 4. 从 input_common 中拔除 Android JNI Input 驱动编译
+          # ========================================================
+          p_input = Path("src/input_common/CMakeLists.txt")
           if p_input.exists():
-              p_input.write_text(re.sub(r'target_link_libraries\(\s*input_common\s+PRIVATE\s+android\s*\)', '', p_input.read_text()))
-          
-          p_common = pathlib.Path('src/common/CMakeLists.txt')
-          if p_common.exists():
-              text = p_common.read_text()
-              text = re.sub(r'target_link_libraries\(\s*common\s+PRIVATE\s+android\s*\)', '', text)
-              for f in ['fs/fs_android.cpp', 'android/android_common.cpp', 'android/id_cache.cpp', 
-                        'android/applets/software_keyboard.cpp', 'android/applets/web_browser.cpp', 
-                        'android/multiplayer/multiplayer.cpp']:
-                  text = text.replace(f, ' ')
-              p_common.write_text(text)
+              s = p_input.read_text()
+              lines = []
+              removed = False
+              for line in s.splitlines(keepends=True):
+                  if "drivers/android.cpp" in line:
+                      removed = True
+                      continue
+                  if "PRIVATE android" in line:
+                      continue # 顺手把 libandroid 框架依赖也扒掉
+                  lines.append(line)
+              
+              if removed:
+                  p_input.write_text("".join(lines))
+                  print("Removed drivers/android.cpp from input_common target.")
+              else:
+                  print("WARNING: drivers/android.cpp not found in input_common CMake.")
 
-          p_cmd = pathlib.Path('src/yuzu_cmd/CMakeLists.txt')
+          # ========================================================
+          # 5. 全局筛查并抹除所有残留的 Android 相关源文件和 yuzu-android target
+          # ========================================================
+          android_sources = (
+              "common/android/",
+              "../common/android/",
+              "fs_android.cpp",
+              "../common/fs/fs_android.cpp",
+          )
+
+          for cmake in Path("src").rglob("CMakeLists.txt"):
+              s = cmake.read_text()
+              
+              # 专门切除 yuzu-android 目录进入指令
+              s = re.sub(r'(if\s*\(\s*ANDROID\s*\)\s*\n\s*add_subdirectory\(\s*android/app/src/main/jni\s*\)\s*\n\s*target_include_directories\(\s*yuzu-android\s+PRIVATE\s+android/app/src/main\s*\)\s*\n\s*endif\s*\(\s*\))', '', s)
+
+              out = []
+              for line in s.splitlines(keepends=True):
+                  stripped = line.strip()
+                  
+                  # 保留合规的配置数据源
+                  if "android_settings.cpp" in stripped:
+                      out.append(line)
+                      continue
+                  
+                  # 如果该行包含任意被禁用的 Android 源码路径，直接丢弃该行
+                  if any(token in stripped for token in android_sources):
+                      print("Removing Android source:", cmake, stripped)
+                      continue
+                  
+                  # 切掉 libmediandk.so 和 libandroid.so 的传递依赖
+                  if "PRIVATE mediandk" in stripped or "PRIVATE android" in stripped:
+                      print("Removing Framework library linkage:", cmake, stripped)
+                      continue
+
+                  out.append(line)
+
+              cmake.write_text("".join(out))
+
+          # ========================================================
+          # 6. yuzu_cmd 加入纯数据配置项并切除设备电量
+          # ========================================================
+          p_cmd = Path('src/yuzu_cmd/CMakeLists.txt')
           if p_cmd.exists():
               text = p_cmd.read_text()
               if 'android_settings.cpp' not in text:
-                  text = re.sub(r'add_executable\s*\(\s*([^\s\)]+)', r'add_executable(\1\n    ../android/app/src/main/jni/android_settings.cpp', text, count=1)
+                  text = text.replace('add_executable(yuzu-cmd\n', 'add_executable(yuzu-cmd\n    ../android/app/src/main/jni/android_settings.cpp\n')
                   p_cmd.write_text(text)
 
-          p_pwr = pathlib.Path('src/common/device_power_state.cpp')
+          p_pwr = Path('src/common/device_power_state.cpp')
           if p_pwr.exists():
               p_pwr.write_text(re.sub(r'#elif\s+defined\(__ANDROID__\)', '#elif defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)', p_pwr.read_text()))
 
-          for header in ['src/input_common/main.cpp', 'src/input_common/main.h']:
-              p_f = pathlib.Path(header)
+          for f in ['src/input_common/main.cpp', 'src/input_common/main.h']:
+              p_f = Path(f)
               if p_f.exists():
                   p_f.write_text(re.sub(r'#if(def\s+__ANDROID__|defined\(__ANDROID__\))', '#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)', p_f.read_text()))
 
+          # ========================================================
+          # 7. SDL3 彻底剔除预编译
+          # ========================================================
           import json
-          cpm = pathlib.Path('cpmfile.json')
+          cpm = Path('cpmfile.json')
           if cpm.exists():
               data = json.loads(cpm.read_text())
               pkg = data.get('sdl3')
@@ -116,74 +221,32 @@ jobs:
                       if k in pkg:
                           del pkg[k]
                   cpm.write_text(json.dumps(data, indent=2) + '\n')
+          PY
 
-          # 强行注入 C++20 stop_token 头文件，避免被 __cpp_lib_jthread 宏屏蔽
-          for header in ['src/common/thread_worker.h', 'src/common/polyfill_thread.h', 'src/common/thread.h']:
-              p_hdr = pathlib.Path(header)
-              if p_hdr.exists():
-                  content = p_hdr.read_text()
-                  if '#include <stop_token>' not in content:
-                      p_hdr.write_text('#include <stop_token>\n' + content)
-                  # 针对 Android NDK libc++ 的 stop_callback 前向声明问题
-                  # 如果还是找不到 std::stop_callback，我们直接暴露给全局
-                  content = p_hdr.read_text()
-                  if 'namespace std' not in content[:500]: # 防止重复
-                      p_hdr.write_text('#include <stop_token>\n#if defined(__ANDROID__)\nnamespace std { using ::std::stop_callback; }\n#endif\n' + content)
-          "
           rm -rf .cache/cpm/sdl3 || true
 
-      - name: Setup Headless Window & C++ Interface
+      - name: Verify Patched Sources Before Build
+        shell: bash
         run: |
-          python3 -c "
-          import pathlib, re
+          set -eux
+          echo "=== Check U+0001/control character ==="
+          if LC_ALL=C grep -RIl $'\001' src/yuzu_cmd/emu_window src/yuzu_cmd/yuzu.cpp; then
+              echo "CRITICAL ERROR: control character 0x01 detected."
+              exit 1
+          fi
+          echo "PASS: no 0x01 control character."
 
-          p_null = pathlib.Path('src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp')
-          clean_null_impl = '''// SPDX-FileCopyrightText: 2026 Eden Emulator Project
-          #include <iostream>
-          #include <SDL3/SDL.h>
-          #include \"yuzu_cmd/emu_window/emu_window_sdl3_null.h\"
+          echo "=== Check headless block ==="
+          grep -n -A8 -B3 "YUZU_BIONIC_CLI" src/yuzu_cmd/emu_window/emu_window_sdl3.cpp
 
-          EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(InputCommon::InputSubsystem* input_subsystem,
-                                                   Core::System& system, bool fullscreen)
-              : EmuWindow_SDL3{input_subsystem, system} {
-              if (render_window != nullptr) {
-                  SDL_HideWindow(render_window);
-              }
-              is_open = true;
-              std::cout << \"[BIONIC] EmuWindow_SDL3_Null: Ready with valid DummyContext.\" << std::endl;
-          }
+          echo "=== Check Android input source ==="
+          if grep -Rni "drivers/android.cpp" src/input_common/CMakeLists.txt; then
+              echo "CRITICAL ERROR: Android input source still enabled."
+              exit 1
+          fi
+          echo "PASS: Android input source removed."
 
-          EmuWindow_SDL3_Null::~EmuWindow_SDL3_Null() = default;
-
-          std::unique_ptr<Core::Frontend::GraphicsContext> EmuWindow_SDL3_Null::CreateSharedContext() const {
-              return std::make_unique<DummyContext>();
-          }
-          '''
-          if p_null.exists():
-              p_null.write_text(clean_null_impl)
-
-          p_base = pathlib.Path('src/yuzu_cmd/emu_window/emu_window_sdl3.cpp')
-          if p_base.exists():
-              base_text = p_base.read_text()
-              base_text = re.sub(r'(input_subsystem->Initialize\(\)\s*;\s*\n)',
-                                 '\\1#ifdef YUZU_BIONIC_CLI\n    std::cout << \"[BIONIC] Headless mode - no physical window\" << std::endl;\n    is_open = true;\n    render_window = nullptr;\n    return;\n#endif\n',
-                                 base_text, count=1)
-              base_text = re.sub(r'EmuWindow_SDL3::~EmuWindow_SDL3\(\)\s*\{',
-                                 'EmuWindow_SDL3::~EmuWindow_SDL3() {\n    if (!render_window) return;',
-                                 base_text, count=1)
-              p_base.write_text(base_text)
-
-          p_yuzu = pathlib.Path('src/yuzu_cmd/yuzu.cpp')
-          if p_yuzu.exists():
-              yuzu_text = p_yuzu.read_text()
-              yuzu_text = yuzu_text.replace('state->system.Initialize();', 'std::cout << \"[BIONIC] Step 1: Init System Core...\" << std::endl;\n    state->system.Initialize();')
-              yuzu_text = yuzu_text.replace('state->system.ApplySettings();', 'std::cout << \"[BIONIC] Step 2: Settings Applied...\" << std::endl;\n    state->system.ApplySettings();')
-              yuzu_text = yuzu_text.replace('state->system.SetContentProvider', 'std::cout << \"[BIONIC] Step 3: Filesystem Ready!\" << std::endl;\n    state->system.SetContentProvider')
-              yuzu_text = yuzu_text.replace('const Core::SystemResultStatus load_result = state->system.Load(', 'std::cout << \"[BIONIC] Step 4: Loading Target ROM...\" << std::endl;\n    const Core::SystemResultStatus load_result = state->system.Load(')
-              p_yuzu.write_text(yuzu_text)
-          "
-
-      - name: Configure CMake
+      - name: Configure CMake (BUNDLED SDL3 OFF)
         run: |
           rm -rf build
           cmake -S . -B build -GNinja \
@@ -208,10 +271,11 @@ jobs:
             -DYUZU_TESTS=OFF \
             -DYUZU_DOWNLOAD_ANDROID_VVL=OFF \
             -DSDL_AUDIO=OFF \
+            -DSDL_OPENSLES=OFF \
+            -DSDL_VIDEO_ANDROID=OFF \
             -DSDL_DUMMYVIDEO=ON \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed" \
-            -DCMAKE_CXX_FLAGS="-fexperimental-library"
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       - name: Build Eden CLI Target
         run: |
@@ -220,9 +284,9 @@ jobs:
           echo "============================================================"
           ninja -C build -j"$(nproc)" yuzu-cmd
 
-      - name: Verify Clean Bionic ELF
+      - name: Validate Binary Cleanliness
         run: |
-          BIN=$(find build/bin -type f -executable | head -n 1)
+          BIN="build/bin/eden-cli"
           test -f "$BIN"
 
           echo "============================================================"
@@ -252,9 +316,8 @@ jobs:
 
       - name: Package Eden Bionic ARM64
         run: |
-          BIN=$(find build/bin -type f -executable | head -n 1)
           rm -rf output_bin && mkdir -p output_bin
-          cp "$BIN" output_bin/eden-cli
+          cp build/bin/eden-cli output_bin/eden-cli
           cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" output_bin/libc++_shared.so
           tar -czf eden-bionic-arm64.tar.gz -C output_bin .
 
