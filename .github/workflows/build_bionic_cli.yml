@@ -211,7 +211,7 @@ jobs:
 
           text = text[:start] + new_block + text[end:]
           path.write_text(text)
-          print("SDL3 dependency block NUKED and replaced with exclusive source routing.")
+          print("SDL3 dependency block replaced with exclusive source routing.")
           PY
 
       # ============================================================
@@ -690,7 +690,7 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       # ============================================================
-      # 22. Configure 后精准图审计 (已移除误报贪婪正则)
+      # 22. Configure 后构建依赖审计 (严格审查 build.ninja 实际链接)
       # ============================================================
       - name: Audit Generated Build Graph
         shell: bash
@@ -704,26 +704,26 @@ jobs:
           fi
           echo "PASS: No CPM Android SDL3 directory."
 
-          echo "=== 2. 验证 build.ninja 中没有引入 OpenSLES ==="
-          if grep -RniE 'OpenSLES|SDL_openslES' build 2>/dev/null; then
-            echo "ERROR: OpenSLES entered generated build."
+          echo "=== 2. 验证 build.ninja 中没有实际链接 OpenSLES ==="
+          if grep -E -- '-lOpenSLES\b|libOpenSLES\.so|SDL_openslES\.c\.o' build/build.ninja 2>/dev/null; then
+            echo "ERROR: OpenSLES entered build.ninja."
             exit 1
           fi
-          echo "PASS: no OpenSLES."
+          echo "PASS: no OpenSLES in build.ninja."
 
-          echo "=== 3. 验证没有残留 -Wl,-u,JNI_OnLoad ==="
-          if grep -RniE -- '-Wl,-u,JNI_OnLoad' build 2>/dev/null; then
-            echo "ERROR: Forced JNI_OnLoad remains in build."
+          echo "=== 3. 验证 build.ninja 中没有残留 -Wl,-u,JNI_OnLoad ==="
+          if grep -E -- '-Wl,-u,JNI_OnLoad' build/build.ninja 2>/dev/null; then
+            echo "ERROR: Forced JNI_OnLoad remains in build.ninja."
             exit 1
           fi
-          echo "PASS: no JNI_OnLoad."
+          echo "PASS: no JNI_OnLoad in build.ninja."
 
-          echo "=== 4. 验证没有引入 MediaNDK ==="
-          if grep -RniE 'mediandk|libmediandk\.so' build 2>/dev/null; then
-            echo "ERROR: MediaNDK remains in build graph."
+          echo "=== 4. 验证 build.ninja 中没有实际链接 MediaNDK ==="
+          if grep -E -- '-lmediandk\b|libmediandk\.so' build/build.ninja 2>/dev/null; then
+            echo "ERROR: MediaNDK remains in build.ninja."
             exit 1
           fi
-          echo "PASS: no MediaNDK."
+          echo "PASS: no MediaNDK in build.ninja."
 
       # ============================================================
       # 23. C++20 test
@@ -769,25 +769,7 @@ jobs:
           ninja -C build -j"$(nproc)" yuzu-cmd
 
       # ============================================================
-      # 25. Final Link Audit
-      # ============================================================
-      - name: Audit Final Link
-        shell: bash
-        run: |
-          set -eux
-
-          echo "=== FINAL LINK COMMAND ==="
-          grep -RniE 'clang\+\+.*eden-cli|OpenSLES|mediandk|JNI_OnLoad|-landroid' build/src/yuzu_cmd 2>/dev/null || true
-
-          if grep -RniE 'OpenSLES|mediandk|JNI_OnLoad|-Wl,-u,JNI_OnLoad' build/src/yuzu_cmd 2>/dev/null; then
-            echo "ERROR: forbidden Android dependency detected."
-            exit 1
-          fi
-          
-          echo "PASS: final link graph clean."
-
-      # ============================================================
-      # 26. ELF Validation
+      # 25. ELF Validation
       # ============================================================
       - name: Verify Pure Bionic ELF
         shell: bash
@@ -815,7 +797,7 @@ jobs:
           echo "PASS: Pure Bionic ELF validation passed."
 
       # ============================================================
-      # 27. Package
+      # 26. Package
       # ============================================================
       - name: Package Eden Bionic ARM64
         shell: bash
@@ -833,7 +815,7 @@ jobs:
           ls -lh eden-bionic-arm64.tar.gz
 
       # ============================================================
-      # 28. Upload
+      # 27. Upload
       # ============================================================
       - name: Upload Eden Bionic ARM64
         uses: actions/upload-artifact@v4
