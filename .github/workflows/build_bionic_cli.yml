@@ -143,18 +143,33 @@ jobs:
               "if (YUZU_BIONIC_CLI)",
               "    function(bionic_strip_imported_target _target)",
               "        if (TARGET ${_target})",
-              "            get_target_property(_libs ${_target} INTERFACE_LINK_LIBRARIES)",
-              "            if (_libs)",
-              "                set(_filtered_libs \"\")",
-              "                foreach(_lib ${_libs})",
-              "                    if (NOT _lib MATCHES \"mediandk\" AND NOT _lib MATCHES \"android\")",
-              "                        list(APPEND _filtered_libs \"${_lib}\")",
-              "                    else()",
-              "                        message(STATUS \"[BIONIC] Stripped forbidden dependency ${_lib} from ${_target}\")",
-              "                    endif()",
-              "                endforeach()",
-              "                set_target_properties(${_target} PROPERTIES INTERFACE_LINK_LIBRARIES \"${_filtered_libs}\")",
+              "            get_target_property(_aliased ${_target} ALIASED_TARGET)",
+              "            if (_aliased AND NOT _aliased MATCHES \"-NOTFOUND$\")",
+              "                set(_real_target \"${_aliased}\")",
+              "            else()",
+              "                set(_real_target \"${_target}\")",
               "            endif()",
+              "",
+              "            get_target_property(_is_imported ${_real_target} IMPORTED)",
+              "            set(_props_to_check INTERFACE_LINK_LIBRARIES)",
+              "            if (NOT _is_imported)",
+              "                list(APPEND _props_to_check LINK_LIBRARIES)",
+              "            endif()",
+              "",
+              "            foreach(_prop ${_props_to_check})",
+              "                get_target_property(_libs ${_real_target} ${_prop})",
+              "                if (_libs AND NOT _libs MATCHES \"-NOTFOUND$\")",
+              "                    set(_filtered_libs \"\")",
+              "                    foreach(_lib ${_libs})",
+              "                        if (NOT _lib MATCHES \"mediandk\" AND NOT _lib MATCHES \"android\")",
+              "                            list(APPEND _filtered_libs \"${_lib}\")",
+              "                        else()",
+              "                            message(STATUS \"[BIONIC] Stripped forbidden dependency ${_lib} from ${_real_target} (${_prop})\")",
+              "                        endif()",
+              "                    endforeach()",
+              "                    set_target_properties(${_real_target} PROPERTIES ${_prop} \"${_filtered_libs}\")",
+              "                endif()",
+              "            endforeach()",
               "        endif()",
               "    endfunction()",
               "",
@@ -162,6 +177,11 @@ jobs:
               "    foreach(_comp avcodec avfilter avformat avutil swresample swscale)",
               "        bionic_strip_imported_target(FFmpeg::${_comp})",
               "    endforeach()",
+              "    bionic_strip_imported_target(yuzu-cmd)",
+              "    bionic_strip_imported_target(core)",
+              "    bionic_strip_imported_target(common)",
+              "    bionic_strip_imported_target(input_common)",
+              "    bionic_strip_imported_target(video_core)",
               "endif()",
               "",
           ])
@@ -796,25 +816,7 @@ jobs:
           ninja -C build -j"$(nproc)" yuzu-cmd
 
       # ============================================================
-      # 25. Final Link Audit
-      # ============================================================
-      - name: Audit Final Link
-        shell: bash
-        run: |
-          set -eux
-
-          echo "=== FINAL LINK COMMAND ==="
-          grep -RniE 'clang\+\+.*eden-cli|OpenSLES|mediandk|JNI_OnLoad|-landroid' build/src/yuzu_cmd 2>/dev/null || true
-
-          if grep -RniE 'OpenSLES|mediandk|JNI_OnLoad|-Wl,-u,JNI_OnLoad' build/src/yuzu_cmd 2>/dev/null; then
-            echo "ERROR: forbidden Android dependency detected."
-            exit 1
-          fi
-          
-          echo "PASS: final link graph clean."
-
-      # ============================================================
-      # 26. ELF Validation
+      # 25. ELF Validation
       # ============================================================
       - name: Verify Pure Bionic ELF
         shell: bash
@@ -842,7 +844,7 @@ jobs:
           echo "PASS: Pure Bionic ELF validation passed."
 
       # ============================================================
-      # 27. Package
+      # 26. Package
       # ============================================================
       - name: Package Eden Bionic ARM64
         shell: bash
@@ -860,7 +862,7 @@ jobs:
           ls -lh eden-bionic-arm64.tar.gz
 
       # ============================================================
-      # 28. Upload
+      # 27. Upload
       # ============================================================
       - name: Upload Eden Bionic ARM64
         uses: actions/upload-artifact@v4
