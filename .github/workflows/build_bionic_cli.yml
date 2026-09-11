@@ -10,11 +10,26 @@ jobs:
   diagnose-eden-deps:
     runs-on: ubuntu-latest
     steps:
+      - name: Free Disk Space
+        shell: bash
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+
       - name: Checkout Eden
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
+
+      - name: Install Host Dependencies
+        shell: bash
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache glslang-tools nasm libtool python3 pkg-config file jq
 
       - name: Setup Android NDK r27c
         id: setup-ndk
@@ -77,7 +92,6 @@ jobs:
           echo "========================================================"
           find .cache/cpm/sdl3 -maxdepth 4 -type f \( -name 'libSDL3.a' -o -name 'CMakeCache.txt' \) -print || true
 
-          # 熔断机制：如果发现预编译的 libSDL3.a，证明 CMake 依赖图未正确转换为源码构建
           if find .cache/cpm/sdl3 -type f -name 'libSDL3.a' | grep -q "libSDL3.a"; then
               echo "CRITICAL ERROR: CMake is still pulling prebuilt Android libSDL3.a!"
               exit 1
