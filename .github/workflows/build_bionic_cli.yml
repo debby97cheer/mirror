@@ -613,34 +613,34 @@ jobs:
           p = Path("src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp")
 
           content = r'''// SPDX-FileCopyrightText: 2026 Eden Emulator Project
-// SPDX-License-Identifier: GPL-3.0-or-later
+          // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <iostream>
-#include <memory>
+          #include <iostream>
+          #include <memory>
 
-#include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"
+          #include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"
 
-EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(
-    InputCommon::InputSubsystem* input_subsystem,
-    Core::System& system,
-    bool fullscreen)
-    : EmuWindow_SDL3{input_subsystem, system} {
-    (void)fullscreen;
+          EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(
+              InputCommon::InputSubsystem* input_subsystem,
+              Core::System& system,
+              bool fullscreen)
+              : EmuWindow_SDL3{input_subsystem, system} {
+              (void)fullscreen;
 
-    is_open = true;
+              is_open = true;
 
-    std::cout
-        << "[BIONIC] EmuWindow_SDL3_Null: initialized"
-        << std::endl;
-}
+              std::cout
+                  << "[BIONIC] EmuWindow_SDL3_Null: initialized"
+                  << std::endl;
+          }
 
-EmuWindow_SDL3_Null::~EmuWindow_SDL3_Null() = default;
+          EmuWindow_SDL3_Null::~EmuWindow_SDL3_Null() = default;
 
-std::unique_ptr<Core::Frontend::GraphicsContext>
-EmuWindow_SDL3_Null::CreateSharedContext() const {
-    return std::make_unique<DummyContext>();
-}
-'''
+          std::unique_ptr<Core::Frontend::GraphicsContext>
+          EmuWindow_SDL3_Null::CreateSharedContext() const {
+              return std::make_unique<DummyContext>();
+          }
+          '''
 
           p.write_text(content)
           print("emu_window_sdl3_null.cpp replaced with interface-complete implementation.")
@@ -677,16 +677,16 @@ EmuWindow_SDL3_Null::CreateSharedContext() const {
           )
 
           replacement = """if (YUZU_BIONIC_CLI)
-    target_include_directories(yuzu-cmd PRIVATE
-        "${EDEN_BIONIC_SDL3_INCLUDE}"
-    )
-    target_link_libraries(yuzu-cmd PRIVATE
-        "${EDEN_BIONIC_SDL3_LIB}"
-        dl
-    )
-else()
-    target_link_libraries(yuzu-cmd PRIVATE SDL3::SDL3)
-endif()"""
+              target_include_directories(yuzu-cmd PRIVATE
+                  "${EDEN_BIONIC_SDL3_INCLUDE}"
+              )
+              target_link_libraries(yuzu-cmd PRIVATE
+                  "${EDEN_BIONIC_SDL3_LIB}"
+                  dl
+              )
+          else()
+              target_link_libraries(yuzu-cmd PRIVATE SDL3::SDL3)
+          endif()"""
 
           if pattern.search(s):
               s = pattern.sub(replacement, s, count=1)
@@ -879,34 +879,35 @@ endif()"""
           if "int main(int argc, char** argv)" not in s:
               s += r'''
 
-#ifdef YUZU_BIONIC_CLI
 
-int main(int argc, char** argv) {
-    setvbuf(stdout, nullptr, _IONBF, 0);
-    setvbuf(stderr, nullptr, _IONBF, 0);
+          #ifdef YUZU_BIONIC_CLI
 
-    if (chdir("/data/eden") != 0) {
-        std::cerr
-            << "Warning: unable to chdir to /data/eden"
-            << std::endl;
-    }
+          int main(int argc, char** argv) {
+              setvbuf(stdout, nullptr, _IONBF, 0);
+              setvbuf(stderr, nullptr, _IONBF, 0);
 
-    SDL_SetMainReady();
+              if (chdir("/data/eden") != 0) {
+                  std::cerr
+                      << "Warning: unable to chdir to /data/eden"
+                      << std::endl;
+              }
 
-    void* appstate = nullptr;
+              SDL_SetMainReady();
 
-    SDL_AppResult result =
-        SDL_AppInit(&appstate, argc, argv);
+              void* appstate = nullptr;
 
-    if (appstate != nullptr) {
-        SDL_AppQuit(appstate, result);
-    }
+              SDL_AppResult result =
+                  SDL_AppInit(&appstate, argc, argv);
 
-    return result == SDL_APP_SUCCESS ? 0 : 1;
-}
+              if (appstate != nullptr) {
+                  SDL_AppQuit(appstate, result);
+              }
 
-#endif
-'''
+              return result == SDL_APP_SUCCESS ? 0 : 1;
+          }
+
+          #endif
+          '''
 
           p.write_text(s)
 
@@ -1263,4 +1264,3 @@ int main(int argc, char** argv) {
             output_bin/
             eden-bionic-arm64.tar.gz
           if-no-files-found: error
-```
