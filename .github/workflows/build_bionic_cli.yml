@@ -53,47 +53,55 @@ jobs:
           python3 -c "
           import pathlib, re
 
-          def safe_patch(filepath, pattern, replacement):
-              p = pathlib.Path(filepath)
-              if p.exists():
-                  text = p.read_text()
-                  patched = re.sub(pattern, replacement, text, flags=re.MULTILINE)
-                  p.write_text(patched)
-                  print(f'Patched: {filepath}')
+          # 1. 安全地屏蔽 yuzu-android target 块
+          p = pathlib.Path('src/CMakeLists.txt')
+          text = p.read_text()
+          text = re.sub(r'(if\s*\(\s*ANDROID\s*\)\s*\n\s*add_subdirectory\(\s*android/app/src/main/jni\s*\)\s*\n\s*target_include_directories\(\s*yuzu-android\s+PRIVATE\s+android/app/src/main\s*\)\s*\n\s*endif\s*\(\s*\))', '', text)
+          p.write_text(text)
 
-          # 1. 剔除核心目录下的 mediandk 和 yuzu-android
-          safe_patch('src/CMakeLists.txt', r'(if\s*\(\s*ANDROID\s*\)\s*\n\s*add_subdirectory\(\s*android/app/src/main/jni\s*\)\s*\n\s*target_include_directories\(\s*yuzu-android\s+PRIVATE\s+android/app/src/main\s*\)\s*\n\s*endif\s*\(\s*\))', '# Disabled yuzu-android block for BIONIC_CLI')
-          safe_patch('src/core/CMakeLists.txt', r'target_link_libraries\(\s*core\s+PRIVATE\s+mediandk\s*\)', '# Mediandk stripped')
+          # 2. 剥离 mediandk
+          p = pathlib.Path('src/core/CMakeLists.txt')
+          text = p.read_text()
+          text = re.sub(r'target_link_libraries\(\s*core\s+PRIVATE\s+mediandk\s*\)', '', text)
+          p.write_text(text)
 
-          # 2. 剔除 -landroid 的链接
-          safe_patch('src/input_common/CMakeLists.txt', r'target_link_libraries\(\s*input_common\s+PRIVATE\s+android\s*\)', '# libandroid stripped')
-          safe_patch('src/common/CMakeLists.txt', r'target_link_libraries\(\s*common\s+PRIVATE\s+android\s*\)', '# libandroid stripped')
+          # 3. 剥离 libandroid
+          p = pathlib.Path('src/input_common/CMakeLists.txt')
+          if p.exists():
+              p.write_text(re.sub(r'target_link_libraries\(\s*input_common\s+PRIVATE\s+android\s*\)', '', p.read_text()))
+          
+          p = pathlib.Path('src/common/CMakeLists.txt')
+          text = p.read_text()
+          text = re.sub(r'target_link_libraries\(\s*common\s+PRIVATE\s+android\s*\)', '', text)
+          # 4. 从 target_sources 中剥离所有 Android 专属文件 (安全替换为空白)
+          text = text.replace('fs/fs_android.cpp', ' ')
+          text = text.replace('android/android_common.cpp', ' ')
+          text = text.replace('android/id_cache.cpp', ' ')
+          text = text.replace('android/applets/software_keyboard.cpp', ' ')
+          text = text.replace('android/applets/web_browser.cpp', ' ')
+          text = text.replace('android/multiplayer/multiplayer.cpp', ' ')
+          p.write_text(text)
 
-          # 3. 剔除 common 库下所有的 Android 专属源码
-          safe_patch('src/common/CMakeLists.txt', r'PUBLIC\s+fs/fs_android\.cpp', '# fs_android.cpp stripped')
-          safe_patch('src/common/CMakeLists.txt', r'android/android_common\.cpp', '# android_common.cpp stripped')
-          safe_patch('src/common/CMakeLists.txt', r'android/id_cache\.cpp', '# id_cache.cpp stripped')
-          safe_patch('src/common/CMakeLists.txt', r'android/applets/software_keyboard\.cpp', '# android software_keyboard.cpp stripped')
-          safe_patch('src/common/CMakeLists.txt', r'android/applets/web_browser\.cpp', '# android web_browser.cpp stripped')
-          safe_patch('src/common/CMakeLists.txt', r'android/multiplayer/multiplayer\.cpp', '# android multiplayer.cpp stripped')
-
-          # 4. 把纯数据结构 android_settings.cpp 加入 yuzu-cmd 编译
+          # 5. 把纯数据结构 android_settings.cpp 加入 yuzu-cmd 编译
           p = pathlib.Path('src/yuzu_cmd/CMakeLists.txt')
           if p.exists():
               text = p.read_text()
               if 'android_settings.cpp' not in text:
                   text = text.replace('add_executable(yuzu-cmd\n', 'add_executable(yuzu-cmd\n    ../android/app/src/main/jni/android_settings.cpp\n')
                   p.write_text(text)
-                  print('Injected android_settings.cpp into yuzu-cmd.')
 
-          # 5. 屏蔽设备电量的 JNI 调用，走无电池回退
-          safe_patch('src/common/device_power_state.cpp', r'#elif\s+defined\(__ANDROID__\)', '#elif defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)')
+          # 6. 屏蔽设备电量的 JNI 调用，走无电池回退
+          p = pathlib.Path('src/common/device_power_state.cpp')
+          if p.exists():
+              p.write_text(re.sub(r'#elif\s+defined\(__ANDROID__\)', '#elif defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)', p.read_text()))
 
-          # 6. 屏蔽输入系统中的 JNI Vibration 驱动
-          safe_patch('src/input_common/main.cpp', r'#if\s*defined\(__ANDROID__\)', '#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)')
-          safe_patch('src/input_common/main.h', r'#if(def\s+__ANDROID__|defined\(__ANDROID__\))', '#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)')
+          # 7. 屏蔽输入系统中的 JNI Vibration 驱动
+          for header in ['src/input_common/main.cpp', 'src/input_common/main.h']:
+              p = pathlib.Path(header)
+              if p.exists():
+                  p.write_text(re.sub(r'#if\s*defined\(__ANDROID__\)', '#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)', p.read_text()))
 
-          # 7. 修改 SDL3 配置文件，清理旧包
+          # 8. 修改 SDL3 配置文件，清理旧包
           import json
           cpm = pathlib.Path('cpmfile.json')
           if cpm.exists():
@@ -112,7 +120,7 @@ jobs:
           python3 -c "
           import pathlib, re
 
-          # 规范化 Null Window 派生类：必须保留合法的 DummyContext，并且去除无效的 render_window 隐藏
+          # 规范化 Null Window 派生类：保留合法的 DummyContext，不隐藏窗口
           p_null_cpp = pathlib.Path('src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp')
           if p_null_cpp.exists():
               clean_null_impl = '''// SPDX-FileCopyrightText: 2026 Eden Emulator Project
@@ -134,17 +142,19 @@ jobs:
               p_null_cpp.write_text(clean_null_impl)
 
           # 短路基类的物理窗口
-          safe_patch = lambda p, r, rep: pathlib.Path(p).write_text(re.sub(r, rep, pathlib.Path(p).read_text()))
-          safe_patch('src/yuzu_cmd/emu_window/emu_window_sdl3.cpp', r'(input_subsystem->Initialize\(\)\s*;\s*\n)', '\\1#ifdef YUZU_BIONIC_CLI\n    std::cout << \"[BIONIC] Headless mode - no physical window\" << std::endl;\n    is_open = true;\n    render_window = nullptr;\n    return;\n#endif\n')
+          p_sdl3_cpp = pathlib.Path('src/yuzu_cmd/emu_window/emu_window_sdl3.cpp')
+          if p_sdl3_cpp.exists():
+              p_sdl3_cpp.write_text(re.sub(r'(input_subsystem->Initialize\(\)\s*;\s*\n)', '\\1#ifdef YUZU_BIONIC_CLI\n    std::cout << \"[BIONIC] Headless mode - no physical window\" << std::endl;\n    is_open = true;\n    render_window = nullptr;\n    return;\n#endif\n', p_sdl3_cpp.read_text()))
 
           # 为 yuzu.cpp 加上启动和模拟循环遥测
           yuzu_cpp = pathlib.Path('src/yuzu_cmd/yuzu.cpp')
-          text = yuzu_cpp.read_text()
-          text = text.replace('state->system.Initialize();', 'std::cout << \"[BIONIC] Step 1: Init System...\" << std::endl;\n    state->system.Initialize();')
-          text = text.replace('state->system.ApplySettings();', 'std::cout << \"[BIONIC] Step 2: Input & Settings...\" << std::endl;\n    state->system.ApplySettings();')
-          text = text.replace('state->system.SetContentProvider', 'std::cout << \"[BIONIC] Step 3: VFS Ready!\" << std::endl;\n    state->system.SetContentProvider')
-          text = text.replace('const Core::SystemResultStatus load_result = state->system.Load(', 'std::cout << \"[BIONIC] Step 4: Loading ROM...\" << std::endl;\n    const Core::SystemResultStatus load_result = state->system.Load(')
-          yuzu_cpp.write_text(text)
+          if yuzu_cpp.exists():
+              text = yuzu_cpp.read_text()
+              text = text.replace('state->system.Initialize();', 'std::cout << \"[BIONIC] Step 1: Init System...\" << std::endl;\n    state->system.Initialize();')
+              text = text.replace('state->system.ApplySettings();', 'std::cout << \"[BIONIC] Step 2: Input & Settings...\" << std::endl;\n    state->system.ApplySettings();')
+              text = text.replace('state->system.SetContentProvider', 'std::cout << \"[BIONIC] Step 3: VFS Ready!\" << std::endl;\n    state->system.SetContentProvider')
+              text = text.replace('const Core::SystemResultStatus load_result = state->system.Load(', 'std::cout << \"[BIONIC] Step 4: Loading ROM...\" << std::endl;\n    const Core::SystemResultStatus load_result = state->system.Load(')
+              yuzu_cpp.write_text(text)
           "
 
       - name: Configure CMake (BUNDLED SDL3 OFF)
@@ -187,7 +197,6 @@ jobs:
           echo "Checking ELF Dynamic Deps:"
           readelf -d "$BIN"
           
-          # 发现任何一个 Android 假库，立刻熔断！
           for BANNED in OpenSLES mediandk android.so gui.so; do
             if readelf -d "$BIN" | grep -i "$BANNED"; then
               echo "CRITICAL ERROR: Banned dynamic library $BANNED detected!"
