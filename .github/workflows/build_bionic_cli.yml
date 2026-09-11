@@ -188,8 +188,6 @@ jobs:
       # ============================================================
       # 7. 精确修改 externals/CMakeLists.txt
       #
-      # 这是本次最重要的修复。
-      #
       # 原版：
       #
       # if (NOT YUZU_USE_BUNDLED_SDL3)
@@ -198,7 +196,7 @@ jobs:
       #     AddJsonPackage(sdl3-ci)
       # endif()
       #
-      # Bionic：
+      # Bionic 使用本地源码：
       #
       # add_subdirectory(third_party/SDL)
       #
@@ -314,7 +312,7 @@ jobs:
               '',
               'endif()',
               '',
-          ]) + "\n"
+          ])
 
           text = (
               text[:start]
@@ -347,41 +345,45 @@ jobs:
           path = Path("src/common/CMakeLists.txt")
           text = path.read_text()
 
-          old_android_sources = '''if(ANDROID)
-    target_sources(
-        common
-        PUBLIC fs/fs_android.cpp
-        fs/fs_android.h
-        android/android_common.cpp
-        android/android_common.h
-        android/id_cache.cpp
-        android/id_cache.h
-        android/multiplayer/multiplayer.cpp
-        android/multiplayer/multiplayer.h
-        android/applets/software_keyboard.cpp
-        android/applets/software_keyboard.h
-        android/applets/web_browser.cpp
-        android/applets/web_browser.h)
-endif()
-'''
+          old_android_sources = "\n".join([
+              'if(ANDROID)',
+              '    target_sources(',
+              '        common',
+              '        PUBLIC fs/fs_android.cpp',
+              '        fs/fs_android.h',
+              '        android/android_common.cpp',
+              '        android/android_common.h',
+              '        android/id_cache.cpp',
+              '        android/id_cache.h',
+              '        android/multiplayer/multiplayer.cpp',
+              '        android/multiplayer/multiplayer.h',
+              '        android/applets/software_keyboard.cpp',
+              '        android/applets/software_keyboard.h',
+              '        android/applets/web_browser.cpp',
+              '        android/applets/web_browser.h)',
+              'endif()',
+              '',
+          ])
 
-          new_android_sources = '''if(ANDROID AND NOT YUZU_BIONIC_CLI)
-    target_sources(
-        common
-        PUBLIC fs/fs_android.cpp
-        fs/fs_android.h
-        android/android_common.cpp
-        android/android_common.h
-        android/id_cache.cpp
-        android/id_cache.h
-        android/multiplayer/multiplayer.cpp
-        android/multiplayer/multiplayer.h
-        android/applets/software_keyboard.cpp
-        android/applets/software_keyboard.h
-        android/applets/web_browser.cpp
-        android/applets/web_browser.h)
-endif()
-'''
+          new_android_sources = "\n".join([
+              'if(ANDROID AND NOT YUZU_BIONIC_CLI)',
+              '    target_sources(',
+              '        common',
+              '        PUBLIC fs/fs_android.cpp',
+              '        fs/fs_android.h',
+              '        android/android_common.cpp',
+              '        android/android_common.h',
+              '        android/id_cache.cpp',
+              '        android/id_cache.h',
+              '        android/multiplayer/multiplayer.cpp',
+              '        android/multiplayer/multiplayer.h',
+              '        android/applets/software_keyboard.cpp',
+              '        android/applets/software_keyboard.h',
+              '        android/applets/web_browser.cpp',
+              '        android/applets/web_browser.h)',
+              'endif()',
+              '',
+          ])
 
           if old_android_sources in text:
               text = text.replace(
@@ -397,17 +399,21 @@ endif()
                   "ERROR: Common Android source block not found."
               )
 
-          old_android_link = '''if(ANDROID)
-    # For ASharedMemory_create
-    target_link_libraries(common PRIVATE android)
-endif()
-'''
+          old_android_link = "\n".join([
+              'if(ANDROID)',
+              '    # For ASharedMemory_create',
+              '    target_link_libraries(common PRIVATE android)',
+              'endif()',
+              '',
+          ])
 
-          new_android_link = '''if(ANDROID AND NOT YUZU_BIONIC_CLI)
-    # For ASharedMemory_create
-    target_link_libraries(common PRIVATE android)
-endif()
-'''
+          new_android_link = "\n".join([
+              'if(ANDROID AND NOT YUZU_BIONIC_CLI)',
+              '    # For ASharedMemory_create',
+              '    target_link_libraries(common PRIVATE android)',
+              'endif()',
+              '',
+          ])
 
           if old_android_link in text:
               text = text.replace(
@@ -446,21 +452,25 @@ endif()
           )
           text = path.read_text()
 
-          old = '''if (ANDROID)
-    target_sources(input_common PRIVATE
-        drivers/android.cpp
-        drivers/android.h)
-    target_link_libraries(input_common PRIVATE android)
-else()
-'''
+          old = "\n".join([
+              'if (ANDROID)',
+              '    target_sources(input_common PRIVATE',
+              '        drivers/android.cpp',
+              '        drivers/android.h)',
+              '    target_link_libraries(input_common PRIVATE android)',
+              'else()',
+              '',
+          ])
 
-          new = '''if (ANDROID AND NOT YUZU_BIONIC_CLI)
-    target_sources(input_common PRIVATE
-        drivers/android.cpp
-        drivers/android.h)
-    target_link_libraries(input_common PRIVATE android)
-else()
-'''
+          new = "\n".join([
+              'if (ANDROID AND NOT YUZU_BIONIC_CLI)',
+              '    target_sources(input_common PRIVATE',
+              '        drivers/android.cpp',
+              '        drivers/android.h)',
+              '    target_link_libraries(input_common PRIVATE android)',
+              'else()',
+              '',
+          ])
 
           if old in text:
               text = text.replace(
@@ -487,10 +497,6 @@ else()
 
       # ============================================================
       # 10. 精确修改 src/CMakeLists.txt
-      #
-      # 只负责：
-      # - 让 YUZU_BIONIC_CLI 进入 yuzu_cmd
-      # - 阻止完整 Android JNI target
       # ============================================================
       - name: Patch src CMake
         shell: bash
@@ -520,17 +526,21 @@ else()
                   "ERROR: YUZU_CMD condition not found."
               )
 
-          old_android_jni = '''if (ANDROID)
-    add_subdirectory(android/app/src/main/jni)
-    target_include_directories(yuzu-android PRIVATE android/app/src/main)
-endif()
-'''
+          old_android_jni = "\n".join([
+              'if (ANDROID)',
+              '    add_subdirectory(android/app/src/main/jni)',
+              '    target_include_directories(yuzu-android PRIVATE android/app/src/main)',
+              'endif()',
+              '',
+          ])
 
-          new_android_jni = '''if (ANDROID AND NOT YUZU_BIONIC_CLI)
-    add_subdirectory(android/app/src/main/jni)
-    target_include_directories(yuzu-android PRIVATE android/app/src/main)
-endif()
-'''
+          new_android_jni = "\n".join([
+              'if (ANDROID AND NOT YUZU_BIONIC_CLI)',
+              '    add_subdirectory(android/app/src/main/jni)',
+              '    target_include_directories(yuzu-android PRIVATE android/app/src/main)',
+              'endif()',
+              '',
+          ])
 
           if old_android_jni in text:
               text = text.replace(
@@ -575,7 +585,6 @@ endif()
               )
               raise SystemExit(0)
 
-          # Only transform an actual complete one-line target_link_libraries.
           pattern = re.compile(
               r'if\s*\(\s*ANDROID\s*\)\s*'
               r'target_link_libraries\s*\(\s*core\s+PRIVATE\s+mediandk\s*\)\s*'
@@ -600,7 +609,6 @@ endif()
               )
 
           else:
-              # Do not guess how a multiline dependency is structured.
               raise SystemExit(
                   "ERROR: mediandk exists in core/CMakeLists.txt "
                   "but its exact dependency block was not recognized. "
@@ -651,7 +659,6 @@ endif()
                   "android_settings.cpp already present."
               )
 
-          # Native Android logging is acceptable in Bionic.
           if (
               "target_link_libraries(yuzu-cmd PRIVATE log)"
               not in text
@@ -795,37 +802,37 @@ endif()
               "src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp"
           )
 
-          null_cpp.write_text(
-              """// SPDX-FileCopyrightText: 2026 Eden Emulator Project
-          // SPDX-License-Identifier: GPL-3.0-or-later
-
-          #include <iostream>
-          #include <memory>
-
-          #include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"
-
-          EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(
-              InputCommon::InputSubsystem* input_subsystem,
-              Core::System& system,
-              bool fullscreen)
-              : EmuWindow_SDL3{input_subsystem, system} {
-              (void)fullscreen;
-
-              is_open = true;
-
-              std::cout
-                  << "[BIONIC] EmuWindow_SDL3_Null: initialized"
-                  << std::endl;
-          }
-
-          EmuWindow_SDL3_Null::~EmuWindow_SDL3_Null() = default;
-
-          std::unique_ptr<Core::Frontend::GraphicsContext>
-          EmuWindow_SDL3_Null::CreateSharedContext() const {
-              return std::make_unique<DummyContext>();
-          }
-          """
-          )
+          null_cpp.write_text("\n".join([
+              '// SPDX-FileCopyrightText: 2026 Eden Emulator Project',
+              '// SPDX-License-Identifier: GPL-3.0-or-later',
+              '',
+              '#include <iostream>',
+              '#include <memory>',
+              '',
+              '#include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"',
+              '',
+              'EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(',
+              '    InputCommon::InputSubsystem* input_subsystem,',
+              '    Core::System& system,',
+              '    bool fullscreen)',
+              '    : EmuWindow_SDL3{input_subsystem, system} {',
+              '    (void)fullscreen;',
+              '',
+              '    is_open = true;',
+              '',
+              '    std::cout',
+              '        << "[BIONIC] EmuWindow_SDL3_Null: initialized"',
+              '        << std::endl;',
+              '}',
+              '',
+              'EmuWindow_SDL3_Null::~EmuWindow_SDL3_Null() = default;',
+              '',
+              'std::unique_ptr<Core::Frontend::GraphicsContext>',
+              'EmuWindow_SDL3_Null::CreateSharedContext() const {',
+              '    return std::make_unique<DummyContext>();',
+              '}',
+              '',
+          ]))
 
           # --------------------------------------------------------
           # Base window
