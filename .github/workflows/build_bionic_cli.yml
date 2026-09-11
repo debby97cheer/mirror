@@ -74,7 +74,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (切除 EmuWindow_SDL3_Null 空指针 + 遥测追踪)
+      # 5. 精确源码重构 (彻底清空 EmuWindow_SDL3_Null 构造体)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -253,7 +253,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 改造 emu_window_sdl3.cpp 为无头基类
+          # 5.8 改造 emu_window_sdl3.cpp 为纯无头模式
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -296,8 +296,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.9 核心修复：切除 emu_window_sdl3_null.cpp 中的 SDL_HideWindow
-          # 彻底根除对 nullptr render_window 的解引用崩溃
+          # 5.9 彻底重构 emu_window_sdl3_null.cpp 的构造函数 (核心断点修复)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -308,19 +307,35 @@ jobs:
               raise SystemExit("ERROR: emu_window_sdl3_null.cpp not found.")
 
           text = path.read_text()
+          print("=== 原始 emu_window_sdl3_null.cpp 内容 ===")
+          print(text)
+          print("=========================================")
 
           if "#include <iostream>" not in text:
               text = "#include <iostream>\n" + text
 
-          # 将 SDL_HideWindow(render_window); 替换为无头就绪日志
-          text = re.sub(
-              r'SDL_HideWindow\s*\([^)]*\)\s*;',
-              'std::cout << "[BIONIC] EmuWindow_SDL3_Null: Headless null window ready." << std::endl;',
-              text
+          # 无论构造函数内部有什么 SDL 调用，直接将整段构造函数体完全清空重写
+          pattern_ctor = re.compile(
+              r'EmuWindow_SDL3_Null::EmuWindow_SDL3_Null\s*\([^)]*\)\s*:[^{]*\{[^}]*\}',
+              re.MULTILINE | re.DOTALL
+          )
+          replacement_ctor = (
+              "EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(InputCommon::InputSubsystem* input_subsystem,\n"
+              "                                         Core::System& system, bool fullscreen)\n"
+              "    : EmuWindow_SDL3{input_subsystem, system, fullscreen} {\n"
+              "    std::cout << \"[BIONIC] EmuWindow_SDL3_Null: Headless null window successfully constructed!\" << std::endl;\n"
+              "    is_open = true;\n"
+              "    render_window = nullptr;\n"
+              "}"
           )
 
+          if pattern_ctor.search(text):
+              text = pattern_ctor.sub(replacement_ctor, text, count=1)
+              print("SUCCESS: EmuWindow_SDL3_Null constructor completely sanitized!")
+          else:
+              raise SystemExit("ERROR: Could not locate EmuWindow_SDL3_Null constructor pattern!")
+
           path.write_text(text)
-          print("emu_window_sdl3_null.cpp patched successfully (SDL_HideWindow neutralized)!")
           PY
 
           # --------------------------------------------------------
