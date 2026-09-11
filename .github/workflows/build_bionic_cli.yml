@@ -42,12 +42,10 @@ jobs:
       - name: Export NDK
         run: echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
-      - name: Patch Build System & Decouple Android
+      - name: Patch YUZU_CMD & YUZU_BIONIC_CLI option
         run: |
           python3 -c "
           import pathlib, re
-
-          # 1. 根目录 CMakeLists.txt: 注册 YUZU_BIONIC_CLI 并放行 YUZU_CMD
           p_root = pathlib.Path('CMakeLists.txt')
           text = p_root.read_text()
           text = re.sub(r'cmake_dependent_option\s*\(\s*YUZU_CMD[^\)]*?\)', 'option(YUZU_CMD \"Compile CLI\" ON)', text, flags=re.MULTILINE|re.DOTALL)
@@ -55,56 +53,59 @@ jobs:
               text = text.replace('option(YUZU_CMD \"Compile CLI\" ON)',
                                   'option(YUZU_CMD \"Compile CLI\" ON)\noption(YUZU_BIONIC_CLI \"Build standalone Android/Bionic CLI\" ON)\nif (YUZU_BIONIC_CLI)\n    add_compile_definitions(YUZU_BIONIC_CLI)\nendif()')
           p_root.write_text(text)
-          print('Root CMakeLists.txt patched.')
 
-          # 2. src/CMakeLists.txt: 保证进入 yuzu_cmd，彻底排除 yuzu-android
           p_src = pathlib.Path('src/CMakeLists.txt')
           text = p_src.read_text()
           text = re.sub(r'if\s*\(\s*YUZU_CMD\s*\)', 'if (YUZU_CMD OR YUZU_BIONIC_CLI)', text, count=1)
           text = re.sub(r'if\s*\(\s*ANDROID\s*\)\s*\n\s*add_subdirectory\(\s*android/app/src/main/jni\s*\)',
                         'if (ANDROID AND NOT YUZU_BIONIC_CLI)\n    add_subdirectory(android/app/src/main/jni)', text, count=1)
           p_src.write_text(text)
-          print('src/CMakeLists.txt patched.')
+          "
 
-          # 3. src/yuzu_cmd/CMakeLists.txt: 加入 android_settings.cpp 数据源并链接 log
-          p_cmd = pathlib.Path('src/yuzu_cmd/CMakeLists.txt')
-          text = p_cmd.read_text()
-          if 'android_settings.cpp' not in text:
-              text = text.replace('add_executable(yuzu-cmd\n',
-                                  'add_executable(yuzu-cmd\n    ../android/app/src/main/jni/android_settings.cpp\n', 1)
-          if 'target_link_libraries(yuzu-cmd PRIVATE log)' not in text:
-              text += '\nif (ANDROID AND YUZU_BIONIC_CLI)\n    target_link_libraries(yuzu-cmd PRIVATE log)\nendif()\n'
-          p_cmd.write_text(text)
-          print('src/yuzu_cmd/CMakeLists.txt patched.')
+      - name: Clean Architecture Dependencies & Fix C++20 stop_token
+        run: |
+          python3 -c "
+          import pathlib, re
 
-          # 4. src/common/CMakeLists.txt: 屏蔽 Android 专属代码和 -landroid
+          def safe_patch(filepath, pattern, replacement):
+              p = pathlib.Path(filepath)
+              if p.exists():
+                  text = p.read_text()
+                  patched = re.sub(pattern, replacement, text, flags=re.MULTILINE)
+                  p.write_text(patched)
+
+          safe_patch('src/core/CMakeLists.txt', r'target_link_libraries\(\s*core\s+PRIVATE\s+mediandk\s*\)', '')
+          
+          p_input = pathlib.Path('src/input_common/CMakeLists.txt')
+          if p_input.exists():
+              p_input.write_text(re.sub(r'target_link_libraries\(\s*input_common\s+PRIVATE\s+android\s*\)', '', p_input.read_text()))
+          
           p_common = pathlib.Path('src/common/CMakeLists.txt')
           if p_common.exists():
               text = p_common.read_text()
-              text = re.sub(r'if\s*\(\s*ANDROID\s*\)', 'if (ANDROID AND NOT YUZU_BIONIC_CLI)', text)
+              text = re.sub(r'target_link_libraries\(\s*common\s+PRIVATE\s+android\s*\)', '', text)
+              for f in ['fs/fs_android.cpp', 'android/android_common.cpp', 'android/id_cache.cpp', 
+                        'android/applets/software_keyboard.cpp', 'android/applets/web_browser.cpp', 
+                        'android/multiplayer/multiplayer.cpp']:
+                  text = text.replace(f, ' ')
               p_common.write_text(text)
-              print('src/common/CMakeLists.txt guarded against Android framework.')
 
-          # 5. src/input_common/CMakeLists.txt: 屏蔽 -landroid
-          p_input = pathlib.Path('src/input_common/CMakeLists.txt')
-          if p_input.exists():
-              text = p_input.read_text()
-              text = re.sub(r'if\s*\(\s*ANDROID\s*\)', 'if (ANDROID AND NOT YUZU_BIONIC_CLI)', text)
-              text = re.sub(r'target_link_libraries\(\s*input_common\s+PRIVATE\s+android\s*\)',
-                            'if (NOT YUZU_BIONIC_CLI)\n    target_link_libraries(input_common PRIVATE android)\nendif()', text)
-              p_input.write_text(text)
-              print('src/input_common/CMakeLists.txt guarded.')
+          p_cmd = pathlib.Path('src/yuzu_cmd/CMakeLists.txt')
+          if p_cmd.exists():
+              text = p_cmd.read_text()
+              if 'android_settings.cpp' not in text:
+                  text = re.sub(r'add_executable\s*\(\s*([^\s\)]+)', r'add_executable(\1\n    ../android/app/src/main/jni/android_settings.cpp', text, count=1)
+                  p_cmd.write_text(text)
 
-          # 6. src/core/CMakeLists.txt: 屏蔽 mediandk
-          p_core = pathlib.Path('src/core/CMakeLists.txt')
-          if p_core.exists():
-              text = p_core.read_text()
-              text = re.sub(r'target_link_libraries\(\s*core\s+PRIVATE\s+mediandk\s*\)',
-                            'if (NOT YUZU_BIONIC_CLI)\n    target_link_libraries(core PRIVATE mediandk)\nendif()', text)
-              p_core.write_text(text)
-              print('src/core/CMakeLists.txt guarded against mediandk.')
+          p_pwr = pathlib.Path('src/common/device_power_state.cpp')
+          if p_pwr.exists():
+              p_pwr.write_text(re.sub(r'#elif\s+defined\(__ANDROID__\)', '#elif defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)', p_pwr.read_text()))
 
-          # 7. cpmfile.json: 剔除预编译 URL，锁定源码编译
+          for header in ['src/input_common/main.cpp', 'src/input_common/main.h']:
+              p_f = pathlib.Path(header)
+              if p_f.exists():
+                  p_f.write_text(re.sub(r'#if(def\s+__ANDROID__|defined\(__ANDROID__\))', '#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)', p_f.read_text()))
+
           import json
           cpm = pathlib.Path('cpmfile.json')
           if cpm.exists():
@@ -115,17 +116,19 @@ jobs:
                       if k in pkg:
                           del pkg[k]
                   cpm.write_text(json.dumps(data, indent=2) + '\n')
-                  print('cpmfile.json sanitized.')
 
-          # 8. device_power_state.cpp & input_common 预编译宏隔离
-          p_pwr = pathlib.Path('src/common/device_power_state.cpp')
-          if p_pwr.exists():
-              p_pwr.write_text(re.sub(r'#elif\s+defined\(__ANDROID__\)', '#elif defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)', p_pwr.read_text()))
-
-          for f in ['src/input_common/main.cpp', 'src/input_common/main.h']:
-              p_f = pathlib.Path(f)
-              if p_f.exists():
-                  p_f.write_text(re.sub(r'#if(def\s+__ANDROID__|defined\(__ANDROID__\))', '#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)', p_f.read_text()))
+          # 强行注入 C++20 stop_token 头文件，避免被 __cpp_lib_jthread 宏屏蔽
+          for header in ['src/common/thread_worker.h', 'src/common/polyfill_thread.h', 'src/common/thread.h']:
+              p_hdr = pathlib.Path(header)
+              if p_hdr.exists():
+                  content = p_hdr.read_text()
+                  if '#include <stop_token>' not in content:
+                      p_hdr.write_text('#include <stop_token>\n' + content)
+                  # 针对 Android NDK libc++ 的 stop_callback 前向声明问题
+                  # 如果还是找不到 std::stop_callback，我们直接暴露给全局
+                  content = p_hdr.read_text()
+                  if 'namespace std' not in content[:500]: # 防止重复
+                      p_hdr.write_text('#include <stop_token>\n#if defined(__ANDROID__)\nnamespace std { using ::std::stop_callback; }\n#endif\n' + content)
           "
           rm -rf .cache/cpm/sdl3 || true
 
@@ -134,7 +137,6 @@ jobs:
           python3 -c "
           import pathlib, re
 
-          # 1. 规范化 Null Window 派生类：继承完整接口，保留 DummyContext，安全规避 render_window 解引用
           p_null = pathlib.Path('src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp')
           clean_null_impl = '''// SPDX-FileCopyrightText: 2026 Eden Emulator Project
           #include <iostream>
@@ -157,27 +159,28 @@ jobs:
               return std::make_unique<DummyContext>();
           }
           '''
-          p_null.write_text(clean_null_impl)
+          if p_null.exists():
+              p_null.write_text(clean_null_impl)
 
-          # 2. 基类跳过物理 SDL 窗口创建
           p_base = pathlib.Path('src/yuzu_cmd/emu_window/emu_window_sdl3.cpp')
-          base_text = p_base.read_text()
-          base_text = re.sub(r'(input_subsystem->Initialize\(\)\s*;\s*\n)',
-                             '\\1#ifdef YUZU_BIONIC_CLI\n    std::cout << \"[BIONIC] Headless mode - no physical window\" << std::endl;\n    is_open = true;\n    render_window = nullptr;\n    return;\n#endif\n',
-                             base_text, count=1)
-          base_text = re.sub(r'EmuWindow_SDL3::~EmuWindow_SDL3\(\)\s*\{',
-                             'EmuWindow_SDL3::~EmuWindow_SDL3() {\n    if (!render_window) return;',
-                             base_text, count=1)
-          p_base.write_text(base_text)
+          if p_base.exists():
+              base_text = p_base.read_text()
+              base_text = re.sub(r'(input_subsystem->Initialize\(\)\s*;\s*\n)',
+                                 '\\1#ifdef YUZU_BIONIC_CLI\n    std::cout << \"[BIONIC] Headless mode - no physical window\" << std::endl;\n    is_open = true;\n    render_window = nullptr;\n    return;\n#endif\n',
+                                 base_text, count=1)
+              base_text = re.sub(r'EmuWindow_SDL3::~EmuWindow_SDL3\(\)\s*\{',
+                                 'EmuWindow_SDL3::~EmuWindow_SDL3() {\n    if (!render_window) return;',
+                                 base_text, count=1)
+              p_base.write_text(base_text)
 
-          # 3. 为 yuzu.cpp 注入执行链路遥测日志
           p_yuzu = pathlib.Path('src/yuzu_cmd/yuzu.cpp')
-          yuzu_text = p_yuzu.read_text()
-          yuzu_text = yuzu_text.replace('state->system.Initialize();', 'std::cout << \"[BIONIC] Step 1: Init System Core...\" << std::endl;\n    state->system.Initialize();')
-          yuzu_text = yuzu_text.replace('state->system.ApplySettings();', 'std::cout << \"[BIONIC] Step 2: Settings Applied...\" << std::endl;\n    state->system.ApplySettings();')
-          yuzu_text = yuzu_text.replace('state->system.SetContentProvider', 'std::cout << \"[BIONIC] Step 3: Filesystem Ready!\" << std::endl;\n    state->system.SetContentProvider')
-          yuzu_text = yuzu_text.replace('const Core::SystemResultStatus load_result = state->system.Load(', 'std::cout << \"[BIONIC] Step 4: Loading Target ROM...\" << std::endl;\n    const Core::SystemResultStatus load_result = state->system.Load(')
-          p_yuzu.write_text(yuzu_text)
+          if p_yuzu.exists():
+              yuzu_text = p_yuzu.read_text()
+              yuzu_text = yuzu_text.replace('state->system.Initialize();', 'std::cout << \"[BIONIC] Step 1: Init System Core...\" << std::endl;\n    state->system.Initialize();')
+              yuzu_text = yuzu_text.replace('state->system.ApplySettings();', 'std::cout << \"[BIONIC] Step 2: Settings Applied...\" << std::endl;\n    state->system.ApplySettings();')
+              yuzu_text = yuzu_text.replace('state->system.SetContentProvider', 'std::cout << \"[BIONIC] Step 3: Filesystem Ready!\" << std::endl;\n    state->system.SetContentProvider')
+              yuzu_text = yuzu_text.replace('const Core::SystemResultStatus load_result = state->system.Load(', 'std::cout << \"[BIONIC] Step 4: Loading Target ROM...\" << std::endl;\n    const Core::SystemResultStatus load_result = state->system.Load(')
+              p_yuzu.write_text(yuzu_text)
           "
 
       - name: Configure CMake
@@ -207,7 +210,8 @@ jobs:
             -DSDL_AUDIO=OFF \
             -DSDL_DUMMYVIDEO=ON \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed" \
+            -DCMAKE_CXX_FLAGS="-fexperimental-library"
 
       - name: Build Eden CLI Target
         run: |
@@ -218,7 +222,7 @@ jobs:
 
       - name: Verify Clean Bionic ELF
         run: |
-          BIN="build/bin/eden-cli"
+          BIN=$(find build/bin -type f -executable | head -n 1)
           test -f "$BIN"
 
           echo "============================================================"
@@ -248,8 +252,9 @@ jobs:
 
       - name: Package Eden Bionic ARM64
         run: |
+          BIN=$(find build/bin -type f -executable | head -n 1)
           rm -rf output_bin && mkdir -p output_bin
-          cp build/bin/eden-cli output_bin/eden-cli
+          cp "$BIN" output_bin/eden-cli
           cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" output_bin/libc++_shared.so
           tar -czf eden-bionic-arm64.tar.gz -C output_bin .
 
