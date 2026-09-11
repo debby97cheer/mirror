@@ -198,15 +198,14 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       - name: Build Eden CLI
-        run: ninja -C build -j"$(nproc)" yuzu-cmd
+        run: ninja -C build -j"$(nproc)" eden-cli
 
       - name: Validate Binary Cleanliness
         run: |
-          BIN="build/bin/yuzu-cmd"
+          BIN="build/bin/eden-cli"
           echo "Checking ELF Dynamic Deps:"
           readelf -d "$BIN"
           
-          # 发现任何一个 Android 假库，立刻熔断！
           for BANNED in OpenSLES mediandk android.so gui.so; do
             if readelf -d "$BIN" | grep -i "$BANNED"; then
               echo "CRITICAL ERROR: Banned dynamic library $BANNED detected!"
@@ -217,7 +216,7 @@ jobs:
       - name: Package Eden Bionic ARM64
         run: |
           rm -rf output_bin && mkdir -p output_bin
-          cp build/bin/yuzu-cmd output_bin/eden-cli
+          cp build/bin/eden-cli output_bin/eden-cli
           cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" output_bin/libc++_shared.so
           tar -czf eden-bionic-arm64.tar.gz -C output_bin .
 
