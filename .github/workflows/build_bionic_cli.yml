@@ -49,14 +49,14 @@ jobs:
 
       - name: Force Disable yuzu-android target
         run: |
-          # 必须暴力且绝对地把 Android JNI 文件夹从构建树中剔除
+          # 必须暴力且绝对地把整个 yuzu-android target 配置剔除
           python3 -c "
           import pathlib, re
           path = pathlib.Path('src/CMakeLists.txt')
           text = path.read_text()
-          text = re.sub(r'add_subdirectory\(\s*android/app/src/main/jni\s*\)', '# \g<0> # Disabled for BIONIC_CLI', text)
+          text = re.sub(r'(if\s*\(\s*ANDROID\s*\)\s*\n\s*add_subdirectory\(\s*android/app/src/main/jni\s*\)\s*\n\s*target_include_directories\(\s*yuzu-android\s+PRIVATE\s+android/app/src/main\s*\)\s*\n\s*endif\s*\(\s*\))', '# Disabled yuzu-android block for BIONIC_CLI', text)
           path.write_text(text)
-          print('Patched src/CMakeLists.txt to comment out yuzu-android jni directory.')
+          print('Patched src/CMakeLists.txt to remove yuzu-android JNI compilation.')
           "
 
       - name: Configure CMake (BUNDLED SDL3 OFF)
