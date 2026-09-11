@@ -74,7 +74,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 架构级源码与构建解耦 (源头治理，零假桩，严禁篡改 ninja)
+      # 5. 源码与构建系统解耦 (源头阻断，绝无假桩，严禁篡改 ninja)
       # ============================================================
       - name: Patch Eden For Pure Bionic Architecture
         shell: bash
@@ -182,7 +182,38 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.4 src/common/CMakeLists.txt: 消除 android 系统库的 PUBLIC 传播
+          # 5.4 切断 AudioCore 对 SDL Audio 的引用链
+          # --------------------------------------------------------
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          # 1. 在 CMake 中排除 sdl_sink.cpp 的编译
+          for p in Path("src/audio_core").rglob("CMakeLists.txt"):
+              text = p.read_text()
+              text = re.sub(
+                  r'if\s*\(\s*YUZU_USE_BUNDLED_SDL3\s+OR\s+SDL3_FOUND\s*\)',
+                  'if ((YUZU_USE_BUNDLED_SDL3 OR SDL3_FOUND) AND NOT YUZU_BIONIC_CLI)',
+                  text
+              )
+              p.write_text(text)
+              print(f"Guarded SDL audio sink in: {p}")
+
+          # 2. 在 sink_details.cpp 中排除 SDLSink 创建分支
+          sink_details = Path("src/audio_core/sink/sink_details.cpp")
+          if sink_details.exists():
+              text = sink_details.read_text()
+              text = re.sub(
+                  r'#if\s+defined\(HAVE_SDL3\)\s*\|\|\s*defined\(YUZU_USE_BUNDLED_SDL3\)',
+                  '#if (defined(HAVE_SDL3) || defined(YUZU_USE_BUNDLED_SDL3)) && !defined(YUZU_BIONIC_CLI)',
+                  text
+              )
+              sink_details.write_text(text)
+              print("Guarded SDLSink branch in sink_details.cpp")
+          PY
+
+          # --------------------------------------------------------
+          # 5.5 src/common/CMakeLists.txt: 消除 android 系统库的 PUBLIC 传播
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -200,7 +231,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.5 src/input_common: 切除 Android Input Engine 实例化
+          # 5.6 src/input_common: 切除 Android Input Engine 实例化
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -219,7 +250,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.6 src/common/device_power_state.cpp: 走标准无电池回退分支
+          # 5.7 src/common/device_power_state.cpp: 走标准无电池回退分支
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -238,7 +269,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.7 src/yuzu_cmd/CMakeLists.txt: 编译原生 android_settings.cpp 数据源
+          # 5.8 src/yuzu_cmd/CMakeLists.txt: 编译原生 android_settings.cpp 数据源
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -264,7 +295,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 规范 EmuWindow_SDL3 抽象基类 (短路物理窗口)
+          # 5.9 规范 EmuWindow_SDL3 抽象基类 (短路物理窗口)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -300,13 +331,12 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.9 规范 EmuWindow_SDL3_Null 派生实现 (复用 emu_window_sdl3.h 中的 DummyContext)
+          # 5.10 规范 EmuWindow_SDL3_Null 派生实现 (复用已有 DummyContext)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
 
           path = Path("src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp")
-          # 彻底移除本地重复的 DummyContext 声明，直接使用基类头文件中已有的定义
           clean_null_impl = (
               "// SPDX-FileCopyrightText: 2026 Eden Emulator Project\n"
               "// SPDX-License-Identifier: GPL-3.0-or-later\n\n"
@@ -328,11 +358,11 @@ jobs:
               "}\n"
           )
           path.write_text(clean_null_impl)
-          print("emu_window_sdl3_null.cpp written cleanly without DummyContext redefinition.")
+          print("emu_window_sdl3_null.cpp written cleanly with existing DummyContext definition.")
           PY
 
           # --------------------------------------------------------
-          # 5.10 yuzu.cpp: 标准入口、无缓冲输出、零假桩
+          # 5.11 yuzu.cpp: 标准入口、无缓冲输出、绝无任何 fake/stub
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -474,11 +504,11 @@ jobs:
               text += native_main
 
           path.write_text(text)
-          print("yuzu.cpp patched cleanly without any fake stubs.")
+          print("yuzu.cpp patched cleanly with ZERO fake stubs.")
           PY
 
           # --------------------------------------------------------
-          # 5.11 cpmfile.json: 关闭 SDL3 的 Audio / Sensor / Android Video
+          # 5.12 强制从 Git 源码构建纯净 SDL3 (根除预编译 OpenSLES)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -487,10 +517,24 @@ jobs:
           path = Path("cpmfile.json")
           if path.exists():
               data = json.loads(path.read_text())
-              package = data.get("sdl3")
-              if package is not None:
-                  options = package.setdefault("options", [])
-                  required = [
+              pkg = data.get("sdl3")
+              if pkg is not None:
+                  # 打印原始配置以供诊断
+                  print("Original sdl3 package entry:", json.dumps(pkg, indent=2))
+                  
+                  # 剔除预编译 URL / binary 属性，迫使 CPM 从 Git 构建
+                  for key in ["url", "binaries", "download_only", "custom_package_url"]:
+                      if key in pkg:
+                          del pkg[key]
+                          print(f"Removed prebuilt package attribute: {key}")
+
+                  # 绑定官方源码仓库与具体 commit
+                  pkg["git_repository"] = "https://github.com/libsdl-org/SDL.git"
+                  pkg["git_tag"] = "147a8ee32dbf9ac02f3794964490687b6bbda1bc"
+                  pkg["git_shallow"] = True
+
+                  # 传递无头/无音频构建选项
+                  pkg["options"] = [
                       "SDL_AUDIO OFF",
                       "SDL_OPENSLES OFF",
                       "SDL_JOYSTICK OFF",
@@ -506,27 +550,19 @@ jobs:
                       "SDL_VIDEO_ANDROID OFF",
                       "SDL_DUMMYVIDEO ON",
                       "SDL_VULKAN ON",
+                      "SDL_DISABLE_INSTALL ON",
                   ]
-                  existing_keys = {
-                      item.split(" ", 1)[0]
-                      for item in options
-                      if isinstance(item, str) and " " in item
-                  }
-                  for item in required:
-                      key = item.split(" ", 1)[0]
-                      if key not in existing_keys:
-                          options.append(item)
                   path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-                  print("cpmfile.json SDL3 options updated cleanly.")
+                  print("cpmfile.json configured to build SDL3 from source cleanly.")
           PY
 
           # --------------------------------------------------------
-          # 5.12 清空旧的 SDL3 预编译缓存
+          # 5.13 彻底清理旧的 CPM 预编译缓存
           # --------------------------------------------------------
-          rm -rf .cache/cpm/sdl3 || true
+          rm -rf .cache/cpm || true
 
           # --------------------------------------------------------
-          # 5.13 补齐 C++20 stop_token 头文件
+          # 5.14 补齐 C++20 stop_token 头文件
           # --------------------------------------------------------
           for f in src/common/thread_worker.h src/common/polyfill_thread.h src/common/thread.h; do
             if [ -f "$f" ] && ! grep -q '#include <stop_token>' "$f"; then
@@ -535,7 +571,7 @@ jobs:
           done
 
       # ============================================================
-      # 6. 配置 CMake (-Wl,--as-needed 确保未引用库不进 DT_NEEDED)
+      # 6. 配置 CMake (-Wl,--as-needed 确保零框架依赖)
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -560,6 +596,7 @@ jobs:
             -DENABLE_QT_TRANSLATION=OFF \
             -DYUZU_USE_BUNDLED_SDL3=ON \
             -DSDL_AUDIO=OFF \
+            -DSDL_OPENSLES=OFF \
             -DSDL_VIDEO=ON \
             -DSDL_JOYSTICK=OFF \
             -DSDL_HAPTIC=OFF \
@@ -624,7 +661,7 @@ jobs:
           echo "C++20 stop_token test passed."
 
       # ============================================================
-      # 8. 编译目标 (原生 Ninja 构建，绝无 sed 篡改)
+      # 8. 编译目标 (原生 Ninja 构建，绝对无 sed 篡改)
       # ============================================================
       - name: Build Eden CLI
         shell: bash
@@ -636,7 +673,7 @@ jobs:
           ninja -C build -j"$(nproc)" eden-cli
 
       # ============================================================
-      # 9. 严格校验纯净度 (两层校验：DT_NEEDED 依赖 + 符号追踪)
+      # 9. 严格校验纯净度 (两层校验：DT_NEEDED 依赖 + 未定义符号追踪)
       # ============================================================
       - name: Verify Clean Bionic ELF
         shell: bash
@@ -650,7 +687,6 @@ jobs:
           echo "============================================================"
           readelf -d "$BIN"
 
-          # 绝不能依赖 Android Framework 动态库
           for BANNED in OpenSLES mediandk android.so gui.so; do
             if readelf -d "$BIN" | grep -i "$BANNED"; then
               echo "CRITICAL ERROR: Banned dynamic library $BANNED detected in DT_NEEDED!"
