@@ -74,7 +74,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (纯无头 EmuWindow + 进程遥测)
+      # 5. 精确源码重构 (切除 EmuWindow_SDL3_Null 空指针 + 遥测追踪)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -253,7 +253,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 改造 emu_window_sdl3.cpp 为纯无头模式 (移除未定义调用)
+          # 5.8 改造 emu_window_sdl3.cpp 为无头基类
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -296,7 +296,35 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.9 深度重构 yuzu.cpp (步骤遥测 + 闭环保护 + 实时终端输出)
+          # 5.9 核心修复：切除 emu_window_sdl3_null.cpp 中的 SDL_HideWindow
+          # 彻底根除对 nullptr render_window 的解引用崩溃
+          # --------------------------------------------------------
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp")
+          if not path.exists():
+              raise SystemExit("ERROR: emu_window_sdl3_null.cpp not found.")
+
+          text = path.read_text()
+
+          if "#include <iostream>" not in text:
+              text = "#include <iostream>\n" + text
+
+          # 将 SDL_HideWindow(render_window); 替换为无头就绪日志
+          text = re.sub(
+              r'SDL_HideWindow\s*\([^)]*\)\s*;',
+              'std::cout << "[BIONIC] EmuWindow_SDL3_Null: Headless null window ready." << std::endl;',
+              text
+          )
+
+          path.write_text(text)
+          print("emu_window_sdl3_null.cpp patched successfully (SDL_HideWindow neutralized)!")
+          PY
+
+          # --------------------------------------------------------
+          # 5.10 深度重构 yuzu.cpp (步骤遥测 + 闭环保护 + 实时终端输出)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -430,7 +458,9 @@ jobs:
                   "\n#ifdef YUZU_BIONIC_CLI\n\n"
                   "#include <cstdint>\n"
                   "#include <cstddef>\n"
-                  "#include <sys/types.h>\n\n"
+                  "#include <sys/types.h>\n"
+                  "#include <thread>\n"
+                  "#include <chrono>\n\n"
                   "extern \"C\" {\n"
                   "struct SLInterfaceID_ { uint32_t a; uint16_t b, c, d; uint8_t e[6]; };\n"
                   "static const struct SLInterfaceID_ s_dummy = {0, 0, 0, 0, {0}};\n"
@@ -507,6 +537,7 @@ jobs:
                   "            break;\n"
                   "        }\n"
                   "        result = SDL_AppIterate(appstate);\n"
+                  "        std::this_thread::sleep_for(std::chrono::milliseconds(16));\n"
                   "    }\n\n"
                   "    if (appstate != nullptr) {\n"
                   "        SDL_AppQuit(appstate, result);\n"
@@ -522,7 +553,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.10 补丁 cpmfile.json 中的 SDL3 包选项
+          # 5.11 补丁 cpmfile.json 中的 SDL3 包选项
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -563,12 +594,12 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.11 清理 CPM SDL3 缓存
+          # 5.12 清理 CPM SDL3 缓存
           # --------------------------------------------------------
           rm -rf .cache/cpm/sdl3 || true
 
           # --------------------------------------------------------
-          # 5.12 链接 log 库
+          # 5.13 链接 log 库
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
