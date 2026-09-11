@@ -267,9 +267,9 @@ jobs:
           PY
 
       # ============================================================
-      # 9. 修改 common/CMakeLists.txt
+      # 9. 修改 common/CMakeLists.txt 并注入 fs_android_bionic 存根
       # ============================================================
-      - name: Patch Common Android Dependencies
+      - name: Patch Common Android Dependencies & Inject Bionic FS Stub
         shell: bash
         run: |
           set -eux
@@ -295,8 +295,52 @@ jobs:
               count=1
           )
 
+          if "fs_android_bionic.cpp" not in text:
+              text += "\nif (YUZU_BIONIC_CLI)\n    target_sources(common PRIVATE fs/fs_android_bionic.cpp)\nendif()\n"
+
           path.write_text(text)
-          print("Common Android dependencies guarded.")
+
+          stub_path = Path("src/common/fs/fs_android_bionic.cpp")
+          stub_path.write_text(
+              "// SPDX-FileCopyrightText: 2026 Eden Emulator Project\n"
+              "// SPDX-License-Identifier: GPL-3.0-or-later\n\n"
+              "#include <cstdint>\n"
+              "#include <string>\n"
+              "#include \"common/common_types.h\"\n"
+              "#include \"common/fs/fs_android.h\"\n\n"
+              "namespace Common::FS::Android {\n\n"
+              "bool IsContentUri(const std::string& path) {\n"
+              "    (void)path;\n"
+              "    return false;\n"
+              "}\n\n"
+              "std::string GetFilename(const std::string& path) {\n"
+              "    (void)path;\n"
+              "    return {};\n"
+              "}\n\n"
+              "std::string GetParentDirectory(const std::string& path) {\n"
+              "    (void)path;\n"
+              "    return {};\n"
+              "}\n\n"
+              "bool Exists(const std::string& path) {\n"
+              "    (void)path;\n"
+              "    return false;\n"
+              "}\n\n"
+              "bool IsDirectory(const std::string& path) {\n"
+              "    (void)path;\n"
+              "    return false;\n"
+              "}\n\n"
+              "u64 GetSize(const std::string& path) {\n"
+              "    (void)path;\n"
+              "    return 0;\n"
+              "}\n\n"
+              "int OpenContentUri(const std::string& filepath, OpenMode open_mode) {\n"
+              "    (void)filepath;\n"
+              "    (void)open_mode;\n"
+              "    return -1;\n"
+              "}\n\n"
+              "} // namespace Common::FS::Android\n"
+          )
+          print("Common dependencies patched and fs_android_bionic.cpp created.")
           PY
 
       # ============================================================
@@ -816,7 +860,7 @@ jobs:
           ninja -C build -j"$(nproc)" yuzu-cmd
 
       # ============================================================
-      # 25. ELF Validation
+      # 25. ELF Validation (严格且精准地审计生成物)
       # ============================================================
       - name: Verify Pure Bionic ELF
         shell: bash
