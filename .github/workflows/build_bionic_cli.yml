@@ -47,6 +47,18 @@ jobs:
           sed -i 's/cmake_dependent_option(YUZU_CMD "Compile the eden-cli executable" OFF "NOT ANDROID" OFF)/option(YUZU_CMD "Compile the eden-cli executable" ON)/g' CMakeLists.txt || true
           sed -i '/option(YUZU_CMD/a option(YUZU_BIONIC_CLI "Build standalone Android/Bionic CLI" OFF)\nif (YUZU_BIONIC_CLI)\nadd_compile_definitions(YUZU_BIONIC_CLI)\nendif()' CMakeLists.txt
 
+      - name: Force Disable yuzu-android target
+        run: |
+          # 必须暴力且绝对地把 Android JNI 文件夹从构建树中剔除
+          python3 -c "
+          import pathlib, re
+          path = pathlib.Path('src/CMakeLists.txt')
+          text = path.read_text()
+          text = re.sub(r'add_subdirectory\(\s*android/app/src/main/jni\s*\)', '# \g<0> # Disabled for BIONIC_CLI', text)
+          path.write_text(text)
+          print('Patched src/CMakeLists.txt to comment out yuzu-android jni directory.')
+          "
+
       - name: Configure CMake (BUNDLED SDL3 OFF)
         run: |
           rm -rf build
@@ -72,8 +84,6 @@ jobs:
             -DYUZU_TESTS=OFF \
             -DYUZU_DOWNLOAD_ANDROID_VVL=OFF \
             -DSDL_AUDIO=OFF \
-            -DSDL_OPENSLES=OFF \
-            -DSDL_VIDEO_ANDROID=OFF \
             -DSDL_DUMMYVIDEO=ON
 
       - name: Run Architecture Dependency Probe
