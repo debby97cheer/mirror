@@ -76,7 +76,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 获取 SDL3 源码 (本地源码编译，绝无预编译 OpenSLES)
+      # 5. 获取 SDL3 源码 (本地源码编译)
       # ============================================================
       - name: Checkout SDL3 Source
         shell: bash
@@ -140,7 +140,7 @@ jobs:
           PY
 
       # ============================================================
-      # 7. 修改 externals/CMakeLists.txt
+      # 7. 修改 externals/CMakeLists.txt (挂载本地源码 SDL3)
       # ============================================================
       - name: Patch SDL3 Dependency Routing
         shell: bash
@@ -243,7 +243,6 @@ jobs:
           path = Path("src/common/CMakeLists.txt")
           text = path.read_text()
 
-          # 替换 target_sources 的 if(ANDROID)
           text = re.sub(
               r'if\s*\(\s*ANDROID\s*\)(?=\s+target_sources\(\s*common\s+PUBLIC\s+fs/fs_android\.cpp)',
               'if(ANDROID AND NOT YUZU_BIONIC_CLI)',
@@ -251,7 +250,6 @@ jobs:
               count=1
           )
 
-          # 替换 target_link_libraries 的 if(ANDROID)
           text = re.sub(
               r'if\s*\(\s*ANDROID\s*\)(?=\s+#\s*For ASharedMemory_create|\s+target_link_libraries\(\s*common\s+PRIVATE\s+android\s*\))',
               'if(ANDROID AND NOT YUZU_BIONIC_CLI)',
@@ -264,7 +262,7 @@ jobs:
           PY
 
       # ============================================================
-      # 9. 修复正则匹配：精确守卫 input_common/CMakeLists.txt
+      # 9. 修改 input_common/CMakeLists.txt
       # ============================================================
       - name: Patch Input Android Driver
         shell: bash
@@ -447,7 +445,7 @@ jobs:
       # ============================================================
       # 15. 从 CMake 源码根除全局 -Wl,-u,JNI_OnLoad 强制链接
       # ============================================================
-      - name: Remove Forced JNI_OnLoad
+      - name: Strip Forced JNI_OnLoad
         shell: bash
         run: |
           set -eux
@@ -706,37 +704,44 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       # ============================================================
-      # 21. Configure 后立即验证
+      # 21. Configure 后精准图审计 (消除跨行正则误报)
       # ============================================================
       - name: Audit Generated Build Graph
         shell: bash
         run: |
           set -eux
 
-          echo "=== Check SDL3 ==="
-          grep -Rni "Using local source SDL3 for Bionic CLI" build || true
-
-          if grep -RniE '\.cache/cpm/sdl3|android-aarch64.*libSDL3\.a' build 2>/dev/null; then
-            echo "ERROR: CPM Android SDL3 detected."
+          echo "=== 1. 验证没有生成预编译 SDL3 缓存目录 ==="
+          if [ -d ".cache/cpm/sdl3" ] || [ -d ".cache/cpm/sdl3-ci" ]; then
+            echo "ERROR: CPM Android SDL3 directory detected in .cache/cpm!"
             exit 1
           fi
-          echo "PASS: no CPM Android SDL3."
+          echo "PASS: No CPM Android SDL3 directory."
 
-          echo "=== Check OpenSLES ==="
+          echo "=== 2. 验证所有 libSDL3.a 依赖严格指向 eden_sdl3 ==="
+          BAD_SDL=$(grep -oE '[^ "=|;]*libSDL3\.a' build/build.ninja | grep -v 'eden_sdl3/libSDL3\.a' || true)
+          if [ -n "$BAD_SDL" ]; then
+            echo "ERROR: Forbidden foreign libSDL3.a detected in build.ninja:"
+            echo "$BAD_SDL"
+            exit 1
+          fi
+          echo "PASS: SDL3 is strictly built from eden_sdl3."
+
+          echo "=== 3. 验证 build.ninja 中没有引入 OpenSLES ==="
           if grep -RniE 'OpenSLES|SDL_openslES' build 2>/dev/null; then
             echo "ERROR: OpenSLES entered generated build."
             exit 1
           fi
           echo "PASS: no OpenSLES."
 
-          echo "=== Check JNI_OnLoad ==="
-          if grep -RniE 'JNI_OnLoad|-Wl,-u,JNI_OnLoad' build 2>/dev/null; then
-            echo "ERROR: JNI_OnLoad remains in build."
+          echo "=== 4. 验证没有残留 -Wl,-u,JNI_OnLoad ==="
+          if grep -RniE -- '-Wl,-u,JNI_OnLoad' build 2>/dev/null; then
+            echo "ERROR: Forced JNI_OnLoad remains in build."
             exit 1
           fi
           echo "PASS: no JNI_OnLoad."
 
-          echo "=== Check MediaNDK ==="
+          echo "=== 5. 验证没有引入 MediaNDK ==="
           if grep -RniE 'mediandk|libmediandk\.so' build 2>/dev/null; then
             echo "ERROR: MediaNDK remains in build graph."
             exit 1
@@ -797,7 +802,7 @@ jobs:
           echo "=== FINAL LINK COMMAND ==="
           grep -RniE 'clang\+\+.*eden-cli|libSDL3\.a|OpenSLES|mediandk|JNI_OnLoad|-landroid' build/src/yuzu_cmd 2>/dev/null || true
 
-          if grep -RniE 'OpenSLES|mediandk|JNI_OnLoad|-Wl,-u,JNI_OnLoad|android-aarch64.*libSDL3\.a' build/src/yuzu_cmd 2>/dev/null; then
+          if grep -RniE 'OpenSLES|mediandk|JNI_OnLoad|-Wl,-u,JNI_OnLoad' build/src/yuzu_cmd 2>/dev/null; then
             echo "ERROR: forbidden Android dependency detected."
             exit 1
           fi
@@ -825,7 +830,7 @@ jobs:
           fi
 
           echo "=== Check Undefined Android Symbols ==="
-          if "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -C "$BIN" | grep -Ei 'slCreateEngine|SL_IID_|ANativeWindow_|ASensorManager_|AAssetManager_|JNI_OnLoad|JavaVM'; then
+          if "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -u "$BIN" | grep -Ei 'slCreateEngine|SL_IID_|ANativeWindow_|ASensorManager_|AAssetManager_|JNI_OnLoad|JavaVM'; then
             echo "ERROR: forbidden Android runtime symbol detected."
             exit 1
           fi
