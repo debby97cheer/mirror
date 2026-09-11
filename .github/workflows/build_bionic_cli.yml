@@ -140,7 +140,28 @@ jobs:
           PY
 
       # ============================================================
-      # 7. 修改 externals/CMakeLists.txt (挂载本地源码 SDL3)
+      # 7. 清除 cpmfile.json 中的 SDL3 预编译包定义
+      # ============================================================
+      - name: Sanitize CPM SDL3 Configuration
+        shell: bash
+        run: |
+          set -eux
+
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          cpm = Path("cpmfile.json")
+          if cpm.exists():
+              data = json.loads(cpm.read_text())
+              if "sdl3" in data:
+                  del data["sdl3"]
+                  cpm.write_text(json.dumps(data, indent=2) + "\n")
+                  print("Deleted 'sdl3' entry from cpmfile.json. CPM will no longer hijack SDL3.")
+          PY
+
+      # ============================================================
+      # 8. 修改 externals/CMakeLists.txt (强制挂载本地源码 SDL3)
       # ============================================================
       - name: Patch SDL3 Dependency Routing
         shell: bash
@@ -200,6 +221,10 @@ jobs:
               '        EXCLUDE_FROM_ALL',
               '    )',
               '',
+              '    if (NOT TARGET SDL3::SDL3)',
+              '        add_library(SDL3::SDL3 ALIAS SDL3-static)',
+              '    endif()',
+              '',
               'elseif (NOT YUZU_USE_BUNDLED_SDL3)',
               '    if (NOT WIN32)',
               '        set(SDL_UNUSED_SUBSYSTEMS File Filesystem Locale Power Render)',
@@ -229,7 +254,7 @@ jobs:
           PY
 
       # ============================================================
-      # 8. 修改 common/CMakeLists.txt
+      # 9. 修改 common/CMakeLists.txt
       # ============================================================
       - name: Patch Common Android Dependencies
         shell: bash
@@ -262,7 +287,7 @@ jobs:
           PY
 
       # ============================================================
-      # 9. 修改 input_common/CMakeLists.txt
+      # 10. 修改 input_common/CMakeLists.txt
       # ============================================================
       - name: Patch Input Android Driver
         shell: bash
@@ -289,7 +314,7 @@ jobs:
           PY
 
       # ============================================================
-      # 10. 修改 src/CMakeLists.txt
+      # 11. 修改 src/CMakeLists.txt
       # ============================================================
       - name: Patch src CMake
         shell: bash
@@ -325,7 +350,7 @@ jobs:
           PY
 
       # ============================================================
-      # 11. Core mediandk
+      # 12. Core mediandk
       # ============================================================
       - name: Patch Core MediaNDK Dependency
         shell: bash
@@ -366,7 +391,7 @@ jobs:
           PY
 
       # ============================================================
-      # 12. yuzu_cmd CMake：android_settings.cpp
+      # 13. yuzu_cmd CMake：android_settings.cpp
       # ============================================================
       - name: Patch yuzu-cmd Sources
         shell: bash
@@ -402,7 +427,7 @@ jobs:
           PY
 
       # ============================================================
-      # 13. Input C++ Android guards
+      # 14. Input C++ Android guards
       # ============================================================
       - name: Patch Input Android Runtime Guards
         shell: bash
@@ -424,7 +449,7 @@ jobs:
           PY
 
       # ============================================================
-      # 14. Battery branch
+      # 15. Battery branch
       # ============================================================
       - name: Patch Android Battery Runtime
         shell: bash
@@ -443,7 +468,7 @@ jobs:
           PY
 
       # ============================================================
-      # 15. 从 CMake 源码根除全局 -Wl,-u,JNI_OnLoad 强制链接
+      # 16. 从 CMake 源码根除全局 -Wl,-u,JNI_OnLoad 强制链接
       # ============================================================
       - name: Strip Forced JNI_OnLoad
         shell: bash
@@ -464,7 +489,7 @@ jobs:
           PY
 
       # ============================================================
-      # 16. Headless EmuWindow
+      # 17. Headless EmuWindow
       # ============================================================
       - name: Patch Headless EmuWindow
         shell: bash
@@ -530,7 +555,7 @@ jobs:
           PY
 
       # ============================================================
-      # 17. Native main + SDL main mode
+      # 18. Native main + SDL main mode
       # ============================================================
       - name: Patch Native Main
         shell: bash
@@ -614,7 +639,7 @@ jobs:
           PY
 
       # ============================================================
-      # 18. C++20 stop_token
+      # 19. C++20 stop_token
       # ============================================================
       - name: Ensure CXX20 stop_token
         shell: bash
@@ -627,7 +652,7 @@ jobs:
           done
 
       # ============================================================
-      # 19. Source validation
+      # 20. Source validation
       # ============================================================
       - name: Validate Patched Sources
         shell: bash
@@ -657,7 +682,7 @@ jobs:
           echo "PASS: Android blocks are guarded."
 
       # ============================================================
-      # 20. Configure
+      # 21. Configure
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -704,7 +729,7 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       # ============================================================
-      # 21. Configure 后精准图审计 (消除跨行正则误报)
+      # 22. Configure 后精准图审计
       # ============================================================
       - name: Audit Generated Build Graph
         shell: bash
@@ -748,7 +773,7 @@ jobs:
           echo "PASS: no MediaNDK."
 
       # ============================================================
-      # 22. C++20 test
+      # 23. C++20 test
       # ============================================================
       - name: Verify CXX20 stop_token
         shell: bash
@@ -779,7 +804,7 @@ jobs:
           file /tmp/test_cpp20
 
       # ============================================================
-      # 23. Build
+      # 24. Build
       # ============================================================
       - name: Build Eden CLI
         shell: bash
@@ -791,7 +816,7 @@ jobs:
           ninja -C build -j"$(nproc)" yuzu-cmd
 
       # ============================================================
-      # 24. Final Link Audit
+      # 25. Final Link Audit
       # ============================================================
       - name: Audit Final Link
         shell: bash
@@ -814,7 +839,7 @@ jobs:
           echo "PASS: final link graph clean."
 
       # ============================================================
-      # 25. ELF Validation
+      # 26. ELF Validation
       # ============================================================
       - name: Verify Pure Bionic ELF
         shell: bash
@@ -842,7 +867,7 @@ jobs:
           echo "PASS: Pure Bionic ELF validation passed."
 
       # ============================================================
-      # 26. Package
+      # 27. Package
       # ============================================================
       - name: Package Eden Bionic ARM64
         shell: bash
@@ -860,7 +885,7 @@ jobs:
           ls -lh eden-bionic-arm64.tar.gz
 
       # ============================================================
-      # 27. Upload
+      # 28. Upload
       # ============================================================
       - name: Upload Eden Bionic ARM64
         uses: actions/upload-artifact@v4
