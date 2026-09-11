@@ -1,4 +1,4 @@
-name: Diagnostic Bionic Architecture Dependencies
+name: Build Eden Bionic Native CLI ARM64
 
 on:
   workflow_dispatch:
@@ -7,8 +7,9 @@ permissions:
   contents: read
 
 jobs:
-  diagnose-eden-deps:
+  build-eden-bionic-arm64:
     runs-on: ubuntu-latest
+
     steps:
       - name: Free Disk Space
         shell: bash
@@ -47,16 +48,103 @@ jobs:
           sed -i 's/cmake_dependent_option(YUZU_CMD "Compile the eden-cli executable" OFF "NOT ANDROID" OFF)/option(YUZU_CMD "Compile the eden-cli executable" ON)/g' CMakeLists.txt || true
           sed -i '/option(YUZU_CMD/a option(YUZU_BIONIC_CLI "Build standalone Android/Bionic CLI" OFF)\nif (YUZU_BIONIC_CLI)\nadd_compile_definitions(YUZU_BIONIC_CLI)\nendif()' CMakeLists.txt
 
-      - name: Force Disable yuzu-android target
+      - name: Clean Architecture Dependencies
         run: |
-          # 必须暴力且绝对地把整个 yuzu-android target 配置剔除
           python3 -c "
           import pathlib, re
-          path = pathlib.Path('src/CMakeLists.txt')
-          text = path.read_text()
-          text = re.sub(r'(if\s*\(\s*ANDROID\s*\)\s*\n\s*add_subdirectory\(\s*android/app/src/main/jni\s*\)\s*\n\s*target_include_directories\(\s*yuzu-android\s+PRIVATE\s+android/app/src/main\s*\)\s*\n\s*endif\s*\(\s*\))', '# Disabled yuzu-android block for BIONIC_CLI', text)
-          path.write_text(text)
-          print('Patched src/CMakeLists.txt to remove yuzu-android JNI compilation.')
+
+          def safe_patch(filepath, pattern, replacement):
+              p = pathlib.Path(filepath)
+              if p.exists():
+                  text = p.read_text()
+                  patched = re.sub(pattern, replacement, text, flags=re.MULTILINE)
+                  p.write_text(patched)
+                  print(f'Patched: {filepath}')
+
+          # 1. 剔除核心目录下的 mediandk 和 yuzu-android
+          safe_patch('src/CMakeLists.txt', r'(if\s*\(\s*ANDROID\s*\)\s*\n\s*add_subdirectory\(\s*android/app/src/main/jni\s*\)\s*\n\s*target_include_directories\(\s*yuzu-android\s+PRIVATE\s+android/app/src/main\s*\)\s*\n\s*endif\s*\(\s*\))', '# Disabled yuzu-android block for BIONIC_CLI')
+          safe_patch('src/core/CMakeLists.txt', r'target_link_libraries\(\s*core\s+PRIVATE\s+mediandk\s*\)', '# Mediandk stripped')
+
+          # 2. 剔除 -landroid 的链接
+          safe_patch('src/input_common/CMakeLists.txt', r'target_link_libraries\(\s*input_common\s+PRIVATE\s+android\s*\)', '# libandroid stripped')
+          safe_patch('src/common/CMakeLists.txt', r'target_link_libraries\(\s*common\s+PRIVATE\s+android\s*\)', '# libandroid stripped')
+
+          # 3. 剔除 common 库下所有的 Android 专属源码
+          safe_patch('src/common/CMakeLists.txt', r'PUBLIC\s+fs/fs_android\.cpp', '# fs_android.cpp stripped')
+          safe_patch('src/common/CMakeLists.txt', r'android/android_common\.cpp', '# android_common.cpp stripped')
+          safe_patch('src/common/CMakeLists.txt', r'android/id_cache\.cpp', '# id_cache.cpp stripped')
+          safe_patch('src/common/CMakeLists.txt', r'android/applets/software_keyboard\.cpp', '# android software_keyboard.cpp stripped')
+          safe_patch('src/common/CMakeLists.txt', r'android/applets/web_browser\.cpp', '# android web_browser.cpp stripped')
+          safe_patch('src/common/CMakeLists.txt', r'android/multiplayer/multiplayer\.cpp', '# android multiplayer.cpp stripped')
+
+          # 4. 把纯数据结构 android_settings.cpp 加入 yuzu-cmd 编译
+          p = pathlib.Path('src/yuzu_cmd/CMakeLists.txt')
+          if p.exists():
+              text = p.read_text()
+              if 'android_settings.cpp' not in text:
+                  text = text.replace('add_executable(yuzu-cmd\n', 'add_executable(yuzu-cmd\n    ../android/app/src/main/jni/android_settings.cpp\n')
+                  p.write_text(text)
+                  print('Injected android_settings.cpp into yuzu-cmd.')
+
+          # 5. 屏蔽设备电量的 JNI 调用，走无电池回退
+          safe_patch('src/common/device_power_state.cpp', r'#elif\s+defined\(__ANDROID__\)', '#elif defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)')
+
+          # 6. 屏蔽输入系统中的 JNI Vibration 驱动
+          safe_patch('src/input_common/main.cpp', r'#if\s*defined\(__ANDROID__\)', '#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)')
+          safe_patch('src/input_common/main.h', r'#if(def\s+__ANDROID__|defined\(__ANDROID__\))', '#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)')
+
+          # 7. 修改 SDL3 配置文件，清理旧包
+          import json
+          cpm = pathlib.Path('cpmfile.json')
+          if cpm.exists():
+              data = json.loads(cpm.read_text())
+              pkg = data.get('sdl3')
+              if pkg:
+                  for k in ['url', 'binaries', 'download_only', 'custom_package_url']:
+                      if k in pkg:
+                          del pkg[k]
+                  cpm.write_text(json.dumps(data, indent=2) + '\n')
+          "
+          rm -rf .cache/cpm/sdl3 || true
+
+      - name: Inject Telemetry and Safe Null Renderer
+        run: |
+          python3 -c "
+          import pathlib, re
+
+          # 规范化 Null Window 派生类：必须保留合法的 DummyContext，并且去除无效的 render_window 隐藏
+          p_null_cpp = pathlib.Path('src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp')
+          if p_null_cpp.exists():
+              clean_null_impl = '''// SPDX-FileCopyrightText: 2026 Eden Emulator Project
+          #include <iostream>
+          #include <SDL3/SDL.h>
+          #include \"yuzu_cmd/emu_window/emu_window_sdl3_null.h\"
+
+          EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(InputCommon::InputSubsystem* input_subsystem, Core::System& system, bool fullscreen)
+              : EmuWindow_SDL3{input_subsystem, system} {
+              is_open = true;
+              std::cout << \"[BIONIC] EmuWindow_SDL3_Null: Ready with valid DummyContext.\" << std::endl;
+          }
+          EmuWindow_SDL3_Null::~EmuWindow_SDL3_Null() = default;
+
+          std::unique_ptr<Core::Frontend::GraphicsContext> EmuWindow_SDL3_Null::CreateSharedContext() const {
+              return std::make_unique<DummyContext>();
+          }
+          '''
+              p_null_cpp.write_text(clean_null_impl)
+
+          # 短路基类的物理窗口
+          safe_patch = lambda p, r, rep: pathlib.Path(p).write_text(re.sub(r, rep, pathlib.Path(p).read_text()))
+          safe_patch('src/yuzu_cmd/emu_window/emu_window_sdl3.cpp', r'(input_subsystem->Initialize\(\)\s*;\s*\n)', '\\1#ifdef YUZU_BIONIC_CLI\n    std::cout << \"[BIONIC] Headless mode - no physical window\" << std::endl;\n    is_open = true;\n    render_window = nullptr;\n    return;\n#endif\n')
+
+          # 为 yuzu.cpp 加上启动和模拟循环遥测
+          yuzu_cpp = pathlib.Path('src/yuzu_cmd/yuzu.cpp')
+          text = yuzu_cpp.read_text()
+          text = text.replace('state->system.Initialize();', 'std::cout << \"[BIONIC] Step 1: Init System...\" << std::endl;\n    state->system.Initialize();')
+          text = text.replace('state->system.ApplySettings();', 'std::cout << \"[BIONIC] Step 2: Input & Settings...\" << std::endl;\n    state->system.ApplySettings();')
+          text = text.replace('state->system.SetContentProvider', 'std::cout << \"[BIONIC] Step 3: VFS Ready!\" << std::endl;\n    state->system.SetContentProvider')
+          text = text.replace('const Core::SystemResultStatus load_result = state->system.Load(', 'std::cout << \"[BIONIC] Step 4: Loading ROM...\" << std::endl;\n    const Core::SystemResultStatus load_result = state->system.Load(')
+          yuzu_cpp.write_text(text)
           "
 
       - name: Configure CMake (BUNDLED SDL3 OFF)
@@ -84,38 +172,38 @@ jobs:
             -DYUZU_TESTS=OFF \
             -DYUZU_DOWNLOAD_ANDROID_VVL=OFF \
             -DSDL_AUDIO=OFF \
-            -DSDL_DUMMYVIDEO=ON
+            -DSDL_OPENSLES=OFF \
+            -DSDL_VIDEO_ANDROID=OFF \
+            -DSDL_DUMMYVIDEO=ON \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
-      - name: Run Architecture Dependency Probe
+      - name: Build Eden CLI
+        run: ninja -C build -j"$(nproc)" eden-cli
+
+      - name: Validate Binary Cleanliness
         run: |
-          echo "========================================================"
-          echo "[PROBE 1] 查找 mediandk 的确切链接来源"
-          echo "========================================================"
-          grep -Rni "mediandk" src CMakeLists.txt externals CMakeModules || true
-
-          echo "========================================================"
-          echo "[PROBE 2] 查找 -landroid 的确切链接来源"
-          echo "========================================================"
-          grep -RniE 'target_link_libraries.*android|target_link_libraries.*mediandk' src CMakeLists.txt externals CMakeModules || true
-
-          echo "========================================================"
-          echo "[PROBE 3] 查找 fs_android 等 Android 专属源码的挂载点"
-          echo "========================================================"
-          grep -Rni "fs_android.cpp" src CMakeLists.txt || true
-          grep -Rni "software_keyboard.cpp" src CMakeLists.txt || true
-
-          echo "========================================================"
-          echo "[PROBE 4] 检查 SDL3 的实际来源 (必须是 SOURCE_DIR，不能是 libSDL3.a)"
-          echo "========================================================"
-          grep -Rni 'SDL3::SDL3\|SDL3_SOURCE_DIR\|SDL3_BINARY_DIR' build CMakeCache.txt || true
+          BIN="build/bin/eden-cli"
+          echo "Checking ELF Dynamic Deps:"
+          readelf -d "$BIN"
           
-          echo "========================================================"
-          echo "[PROBE 5] 扫描本地 CPM 缓存中是否仍然拉取了预编译的 libSDL3.a"
-          echo "========================================================"
-          find .cache/cpm/sdl3 -maxdepth 4 -type f \( -name 'libSDL3.a' -o -name 'CMakeCache.txt' \) -print || true
-
-          if find .cache/cpm/sdl3 -type f -name 'libSDL3.a' | grep -q "libSDL3.a"; then
-              echo "CRITICAL ERROR: CMake is still pulling prebuilt Android libSDL3.a!"
+          # 发现任何一个 Android 假库，立刻熔断！
+          for BANNED in OpenSLES mediandk android.so gui.so; do
+            if readelf -d "$BIN" | grep -i "$BANNED"; then
+              echo "CRITICAL ERROR: Banned dynamic library $BANNED detected!"
               exit 1
-          fi
-          echo "PASS: No prebuilt libSDL3.a detected in CPM cache."
+            fi
+          done
+
+      - name: Package Eden Bionic ARM64
+        run: |
+          rm -rf output_bin && mkdir -p output_bin
+          cp build/bin/eden-cli output_bin/eden-cli
+          cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" output_bin/libc++_shared.so
+          tar -czf eden-bionic-arm64.tar.gz -C output_bin .
+
+      - name: Upload Eden Bionic ARM64
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-bionic-arm64
+          path: eden-bionic-arm64.tar.gz
