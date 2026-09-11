@@ -53,6 +53,14 @@ jobs:
           python3 -c "
           import pathlib, re
 
+          def safe_patch(filepath, pattern, replacement):
+              p = pathlib.Path(filepath)
+              if p.exists():
+                  text = p.read_text()
+                  patched = re.sub(pattern, replacement, text, flags=re.MULTILINE)
+                  p.write_text(patched)
+                  print(f'Patched: {filepath}')
+
           # 1. 安全地屏蔽 yuzu-android target 块
           p = pathlib.Path('src/CMakeLists.txt')
           text = p.read_text()
@@ -89,6 +97,7 @@ jobs:
               if 'android_settings.cpp' not in text:
                   text = text.replace('add_executable(yuzu-cmd\n', 'add_executable(yuzu-cmd\n    ../android/app/src/main/jni/android_settings.cpp\n')
                   p.write_text(text)
+                  print('Injected android_settings.cpp into yuzu-cmd.')
 
           # 6. 屏蔽设备电量的 JNI 调用，走无电池回退
           p = pathlib.Path('src/common/device_power_state.cpp')
@@ -189,14 +198,15 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       - name: Build Eden CLI
-        run: ninja -C build -j"$(nproc)" eden-cli
+        run: ninja -C build -j"$(nproc)" yuzu-cmd
 
       - name: Validate Binary Cleanliness
         run: |
-          BIN="build/bin/eden-cli"
+          BIN="build/bin/yuzu-cmd"
           echo "Checking ELF Dynamic Deps:"
           readelf -d "$BIN"
           
+          # 发现任何一个 Android 假库，立刻熔断！
           for BANNED in OpenSLES mediandk android.so gui.so; do
             if readelf -d "$BIN" | grep -i "$BANNED"; then
               echo "CRITICAL ERROR: Banned dynamic library $BANNED detected!"
@@ -207,7 +217,7 @@ jobs:
       - name: Package Eden Bionic ARM64
         run: |
           rm -rf output_bin && mkdir -p output_bin
-          cp build/bin/eden-cli output_bin/eden-cli
+          cp build/bin/yuzu-cmd output_bin/eden-cli
           cp "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" output_bin/libc++_shared.so
           tar -czf eden-bionic-arm64.tar.gz -C output_bin .
 
