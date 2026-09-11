@@ -74,7 +74,7 @@ jobs:
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 精确源码重构 (彻底清空 EmuWindow_SDL3_Null 构造体)
+      # 5. 精确源码重构 (纯无头 EmuWindow + 进程遥测)
       # ============================================================
       - name: Patch Eden For Bionic CLI
         shell: bash
@@ -253,7 +253,7 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.8 改造 emu_window_sdl3.cpp 为纯无头模式
+          # 5.8 改造 emu_window_sdl3.cpp 为纯无头基类
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
@@ -296,46 +296,27 @@ jobs:
           PY
 
           # --------------------------------------------------------
-          # 5.9 彻底重构 emu_window_sdl3_null.cpp 的构造函数 (核心断点修复)
+          # 5.9 彻底重构 emu_window_sdl3_null.cpp (纯净无头，参数精准对应)
           # --------------------------------------------------------
           python3 <<'PY'
           from pathlib import Path
-          import re
 
           path = Path("src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp")
-          if not path.exists():
-              raise SystemExit("ERROR: emu_window_sdl3_null.cpp not found.")
-
-          text = path.read_text()
-          print("=== 原始 emu_window_sdl3_null.cpp 内容 ===")
-          print(text)
-          print("=========================================")
-
-          if "#include <iostream>" not in text:
-              text = "#include <iostream>\n" + text
-
-          # 无论构造函数内部有什么 SDL 调用，直接将整段构造函数体完全清空重写
-          pattern_ctor = re.compile(
-              r'EmuWindow_SDL3_Null::EmuWindow_SDL3_Null\s*\([^)]*\)\s*:[^{]*\{[^}]*\}',
-              re.MULTILINE | re.DOTALL
-          )
-          replacement_ctor = (
+          clean_null_window = (
+              "// SPDX-FileCopyrightText: 2026 Eden Emulator Project\n"
+              "// SPDX-License-Identifier: GPL-3.0-or-later\n\n"
+              "#include <iostream>\n"
+              "#include \"yuzu_cmd/emu_window/emu_window_sdl3_null.h\"\n\n"
               "EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(InputCommon::InputSubsystem* input_subsystem,\n"
               "                                         Core::System& system, bool fullscreen)\n"
-              "    : EmuWindow_SDL3{input_subsystem, system, fullscreen} {\n"
+              "    : EmuWindow_SDL3{input_subsystem, system} {\n"
               "    std::cout << \"[BIONIC] EmuWindow_SDL3_Null: Headless null window successfully constructed!\" << std::endl;\n"
               "    is_open = true;\n"
-              "    render_window = nullptr;\n"
-              "}"
+              "}\n\n"
+              "EmuWindow_SDL3_Null::~EmuWindow_SDL3_Null() = default;\n"
           )
-
-          if pattern_ctor.search(text):
-              text = pattern_ctor.sub(replacement_ctor, text, count=1)
-              print("SUCCESS: EmuWindow_SDL3_Null constructor completely sanitized!")
-          else:
-              raise SystemExit("ERROR: Could not locate EmuWindow_SDL3_Null constructor pattern!")
-
-          path.write_text(text)
+          path.write_text(clean_null_window)
+          print("emu_window_sdl3_null.cpp cleanly written with valid 2-arg base constructor!")
           PY
 
           # --------------------------------------------------------
