@@ -135,35 +135,37 @@ jobs:
               )
               text = text.replace(marker, block, 1)
 
-          # 在根 CMake 尾部追加逻辑：在目标解析后彻底从 FFmpeg 目标剥离 mediandk 和 android
-          ffmpeg_filter_block = """
-# =========================================================================
-# Bionic CLI: 拦截并剔除第三方库 (如 FFmpeg) 传导的 Android 专属动态库
-# =========================================================================
-if (YUZU_BIONIC_CLI)
-    function(bionic_strip_imported_target _target)
-        if (TARGET ${_target})
-            get_target_property(_libs ${_target} INTERFACE_LINK_LIBRARIES)
-            if (_libs)
-                set(_filtered_libs "")
-                foreach(_lib ${_libs})
-                    if (NOT _lib MATCHES "mediandk" AND NOT _lib MATCHES "android")
-                        list(APPEND _filtered_libs "${_lib}")
-                    else()
-                        message(STATUS "[BIONIC] Stripped forbidden dependency ${_lib} from ${_target}")
-                    endif()
-                endforeach()
-                set_target_properties(${_target} PROPERTIES INTERFACE_LINK_LIBRARIES "${_filtered_libs}")
-            endif()
-        endif()
-    endfunction()
+          ffmpeg_filter_block = "\n".join([
+              "",
+              "# =========================================================================",
+              "# Bionic CLI: 拦截并剔除第三方库 (如 FFmpeg) 传导的 Android 专属动态库",
+              "# =========================================================================",
+              "if (YUZU_BIONIC_CLI)",
+              "    function(bionic_strip_imported_target _target)",
+              "        if (TARGET ${_target})",
+              "            get_target_property(_libs ${_target} INTERFACE_LINK_LIBRARIES)",
+              "            if (_libs)",
+              "                set(_filtered_libs \"\")",
+              "                foreach(_lib ${_libs})",
+              "                    if (NOT _lib MATCHES \"mediandk\" AND NOT _lib MATCHES \"android\")",
+              "                        list(APPEND _filtered_libs \"${_lib}\")",
+              "                    else()",
+              "                        message(STATUS \"[BIONIC] Stripped forbidden dependency ${_lib} from ${_target}\")",
+              "                    endif()",
+              "                endforeach()",
+              "                set_target_properties(${_target} PROPERTIES INTERFACE_LINK_LIBRARIES \"${_filtered_libs}\")",
+              "            endif()",
+              "        endif()",
+              "    endfunction()",
+              "",
+              "    bionic_strip_imported_target(FFmpeg::FFmpeg)",
+              "    foreach(_comp avcodec avfilter avformat avutil swresample swscale)",
+              "        bionic_strip_imported_target(FFmpeg::${_comp})",
+              "    endforeach()",
+              "endif()",
+              "",
+          ])
 
-    bionic_strip_imported_target(FFmpeg::FFmpeg)
-    foreach(_comp avcodec avfilter avformat avutil swresample swscale)
-        bionic_strip_imported_target(FFmpeg::${_comp})
-    endforeach()
-endif()
-"""
           text += ffmpeg_filter_block
           path.write_text(text)
           print("Root CMake patched with FFmpeg filter.")
@@ -625,7 +627,7 @@ endif()
           PY
 
       # ============================================================
-      # 18. C++20 stop_token
+      # 19. C++20 stop_token
       # ============================================================
       - name: Ensure CXX20 stop_token
         shell: bash
@@ -638,7 +640,7 @@ endif()
           done
 
       # ============================================================
-      # 19. Source validation
+      # 20. Source validation
       # ============================================================
       - name: Validate Patched Sources
         shell: bash
@@ -668,7 +670,7 @@ endif()
           echo "PASS: Android blocks are guarded."
 
       # ============================================================
-      # 20. Configure
+      # 21. Configure
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -715,7 +717,7 @@ endif()
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       # ============================================================
-      # 21. Configure 后精准图审计
+      # 22. Configure 后构建依赖审计
       # ============================================================
       - name: Audit Generated Build Graph
         shell: bash
@@ -751,7 +753,7 @@ endif()
           echo "PASS: no MediaNDK in build.ninja."
 
       # ============================================================
-      # 22. C++20 test
+      # 23. C++20 test
       # ============================================================
       - name: Verify CXX20 stop_token
         shell: bash
@@ -782,7 +784,7 @@ endif()
           file /tmp/test_cpp20
 
       # ============================================================
-      # 23. Build
+      # 24. Build
       # ============================================================
       - name: Build Eden CLI
         shell: bash
@@ -794,7 +796,7 @@ endif()
           ninja -C build -j"$(nproc)" yuzu-cmd
 
       # ============================================================
-      # 24. Final Link Audit
+      # 25. Final Link Audit
       # ============================================================
       - name: Audit Final Link
         shell: bash
@@ -812,7 +814,7 @@ endif()
           echo "PASS: final link graph clean."
 
       # ============================================================
-      # 25. ELF Validation
+      # 26. ELF Validation
       # ============================================================
       - name: Verify Pure Bionic ELF
         shell: bash
@@ -840,7 +842,7 @@ endif()
           echo "PASS: Pure Bionic ELF validation passed."
 
       # ============================================================
-      # 26. Package
+      # 27. Package
       # ============================================================
       - name: Package Eden Bionic ARM64
         shell: bash
@@ -858,7 +860,7 @@ endif()
           ls -lh eden-bionic-arm64.tar.gz
 
       # ============================================================
-      # 27. Upload
+      # 28. Upload
       # ============================================================
       - name: Upload Eden Bionic ARM64
         uses: actions/upload-artifact@v4
