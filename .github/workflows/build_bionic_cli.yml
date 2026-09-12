@@ -1177,19 +1177,8 @@ jobs:
           PY
 
             # ============================================================
+      # ============================================================
       # 18. 切断 Eden Android AdrenoTools / LinkerNSBypass
-      #
-      # 目标：Bionic CLI 下完全不引入任何 Android GPU 驱动层
-      #
-      # 处理：
-      #   - externals：不构建 libadrenotools
-      #   - video_core：不链接 adrenotools
-      #   - 全源码扫描 src/：
-      #       * 移除之前补丁插入的 adrenotools guard/macro（幂等）
-      #       * 给 #include <adrenotools/...> 加上
-      #         #if !defined(YUZU_BIONIC_CLI) ... #endif
-      #       * 把 adrenotools_* / bcenabler_* 调用换成 no-op 宏，
-      #         宏放在文件最顶部（任何 #if 之外）
       # ============================================================
       - name: Disable Android AdrenoTools for Bionic CLI
         shell: bash
@@ -1203,7 +1192,6 @@ jobs:
           # ========================================================
           # 1. externals/CMakeLists.txt
           # ========================================================
-
           path = Path("externals/CMakeLists.txt")
           text = path.read_text()
 
@@ -1224,15 +1212,12 @@ jobs:
           elif new in text:
               print("[BIONIC] externals: already disabled.")
           else:
-              raise SystemExit(
-                  "ERROR: externals libadrenotools block not found."
-              )
+              raise SystemExit("ERROR: externals libadrenotools block not found.")
           path.write_text(text)
 
           # ========================================================
           # 2. src/video_core/CMakeLists.txt
           # ========================================================
-
           path = Path("src/video_core/CMakeLists.txt")
           text = path.read_text()
 
@@ -1253,39 +1238,83 @@ jobs:
           elif new in text:
               print("[BIONIC] video_core: already disabled.")
           else:
-              raise SystemExit(
-                  "ERROR: video_core adrenotools block not found."
-              )
+              raise SystemExit("ERROR: video_core adrenotools block not found.")
           path.write_text(text)
 
           # ========================================================
-          # 3. 全源码扫描：src/**/*.{cpp,h,hpp,c,cc}
+          # 3. 创建 adrenotools stub header
           # ========================================================
+          stub_path = Path("src/video_core/vulkan_common/adrenotools_bionic_stub.h")
+          stub_path.parent.mkdir(parents=True, exist_ok=True)
 
+          stub_path.write_text(r'''// SPDX-FileCopyrightText: 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#if defined(YUZU_BIONIC_CLI)
+
+/* ---- adrenotools BCN patcher ---- */
+#define ADRENOTOOLS_BCN_NO_PATCH 0
+#define ADRENOTOOLS_BCN_PATCH    1
+#define ADRENOTOOLS_BCN_BLOB     2
+
+static inline int adrenotools_get_bcn_type(int major, int minor, int vendor) {
+    (void)major; (void)minor; (void)vendor;
+    return ADRENOTOOLS_BCN_NO_PATCH;
+}
+
+static inline int adrenotools_patch_bcn(void* vkGetPhysicalDeviceFormatProperties) {
+    (void)vkGetPhysicalDeviceFormatProperties;
+    return 0; /* false: no BCN patch applied */
+}
+
+/* ---- adrenotools turbo / driver hooks (fill more as needed) ---- */
+static inline void* adrenotools_api_create(void) { return (void*)0; }
+static inline void  adrenotools_api_destroy(void* api) { (void)api; }
+
+/* ---- bcenabler hooks ---- */
+static inline int bcenabler_patch_gpu_driver(void* target_device_extension) {
+    (void)target_device_extension;
+    return 0;
+}
+static inline int bcenabler_apply_standard_patch(void) { return 0; }
+
+#endif /* YUZU_BIONIC_CLI */
+
+#ifdef __cplusplus
+}
+#endif
+''')
+          print(f"[BIONIC] created {stub_path}")
+
+          # ========================================================
+          # 4. 全源码扫描并替换 adrenotools include
+          # ========================================================
           include_re = re.compile(
-              r'#\s*include\s*<(adrenotools/[^>]+)>'
-          )
-          ident_re = re.compile(
-              r'\b((?:adrenotools|bcenabler)_[A-Za-z0-9_]+)\s*\('
+              r'^([ \t]*)#\s*include\s*<(adrenotools/[a-zA-Z0-9_./]+)>[ \t]*$',
+              re.MULTILINE,
           )
 
-          # 之前错插的 include guard（外层 !defined）
+          # 清理旧补丁的 regex
           stale_guard_re = re.compile(
               r'[ \t]*#if\s+!defined\s*\(\s*YUZU_BIONIC_CLI\s*\)[ \t]*\r?\n'
-              r'([ \t]*#\s*include\s*<adrenotools/[^>]+>[ \t]*\r?\n)'
+              r'[ \t]*#\s*include\s*<adrenotools/[a-zA-Z0-9_./]+>[ \t]*\r?\n'
               r'[ \t]*#endif[ \t]*\r?\n?',
           )
-          # 之前错插的宏块（外层 defined）
           stale_macro_re = re.compile(
               r'[ \t]*#if\s+defined\s*\(\s*YUZU_BIONIC_CLI\s*\)[ \t]*\r?\n'
-              r'(?:[ \t]*#define[ \t]+'
-              r'(?:adrenotools|bcenabler)_[A-Za-z0-9_]+\([^\n]*\r?\n)+'
+              r'(?:[ \t]*#define[ \t]+(?:adrenotools|bcenabler)_[A-Za-z0-9_]+\([^\n]*\r?\n)+'
               r'[ \t]*#endif[ \t]*\r?\n?',
           )
 
           targets = []
-          for ext in ("*.cpp", "*.h", "*.hpp", "*.c", "*.cc"):
-              for p in Path("src").rglob(ext):
+          for ext in (".cpp", ".c", ".h", ".hpp", ".cc"):
+              for p in Path("src").rglob(f"*{ext}"):
                   try:
                       t = p.read_text()
                   except Exception:
@@ -1293,102 +1322,39 @@ jobs:
                   if "adrenotools" in t or "bcenabler" in t:
                       targets.append(p)
 
-          print(
-              f"[BIONIC] scanning {len(targets)} file(s) with "
-              f"adrenotools/bcenabler references."
-          )
+          print(f"[BIONIC] scanning {len(targets)} file(s)")
 
           for path in targets:
-
               text = path.read_text()
               original = text
 
-              # ---- 3.1 清理旧补丁遗留 ----
-
-              # 先删宏块
-              while True:
-                  new_text = stale_macro_re.sub("", text)
-                  if new_text == text:
-                      break
-                  text = new_text
-
-              # 再循环删除 include 外层 guard（可能嵌套）
+              # 删除旧 guard
               for _ in range(5):
-                  new_text = stale_guard_re.sub(r'\1', text)
+                  new_text = stale_guard_re.sub("", text)
                   if new_text == text:
                       break
                   text = new_text
 
-              # ---- 3.2 收集 idents ----
-
-              idents = sorted(
-                  set(m.group(1) for m in ident_re.finditer(text))
-              )
-
-              # ---- 3.3 把 no-op 宏放文件最顶部 ----
-              #
-              # 必须在任何 #if 之外，否则宏会被跳过。
-              # 插在 SPDX 注释之后（第一行非注释行之前）。
-              # --------------------------------------------------
-
-              if idents:
-
-                  macros_block = (
-                      "#if defined(YUZU_BIONIC_CLI)\n"
-                      + "\n".join(
-                          f"#define {i}(...) ((void)0)"
-                          for i in idents
-                      )
-                      + "\n#endif\n"
-                  )
-
-                  # 找到文件第一个非空、非注释、非预处理行
-                  # 简单实现：找 SPDX 注释结束后的第一个空行之后
-                  lines = text.splitlines(keepends=True)
-                  insert_line = 0
-                  # 跳过连续的行注释 // 和 /* */
-                  in_block_comment = False
-                  for i, ln in enumerate(lines):
-                      stripped = ln.strip()
-                      if in_block_comment:
-                          if "*/" in stripped:
-                              in_block_comment = False
-                          insert_line = i + 1
-                          continue
-                      if stripped.startswith("/*"):
-                          if "*/" not in stripped:
-                              in_block_comment = True
-                          insert_line = i + 1
-                          continue
-                      if stripped.startswith("//") or stripped == "":
-                          insert_line = i + 1
-                          continue
+              # 删除旧 ((void)0) 宏块
+              while True:
+ new_text = stale_macro_re.sub("", text)
+                  if new_text == text:
                       break
+                  text = new_text
 
-                  text = (
-                      "".join(lines[:insert_line])
-                      + macros_block
-                      + "\n"
-                      + "".join(lines[insert_line:])
+              # 替换 include：Bionic 下用 stub header
+              def replace_inc(m):
+                  indent = m.group(1)
+                  inc = m.group(0).lstrip()
+                  return (
+                      f"{indent}#if !defined(YUZU_BIONIC_CLI)\n"
+                      f"{indent}{inc}\n"
+                      f"{indent}#else\n"
+                      f'{indent}#include "video_core/vulkan_common/adrenotools_bionic_stub.h"\n'
+                      f"{indent}#endif"
                   )
 
-                  print(
-                      f"[BIONIC] {path}: injected no-op macros "
-                      f"for {', '.join(idents)}"
-                  )
-
-              # ---- 3.4 包裹 adrenotools include ----
-
-              for m in list(include_re.finditer(text)):
-                  inc = m.group(0)
-                  wrapped = (
-                      "#if !defined(YUZU_BIONIC_CLI)\n"
-                      + inc + "\n"
-                      + "#endif"
-                  )
-                  if wrapped in text:
-                      continue
-                  text = text.replace(inc, wrapped, 1)
+              text = include_re.sub(replace_inc, text)
 
               if text != original:
                   path.write_text(text)
@@ -1398,29 +1364,14 @@ jobs:
           PY
 
           echo
-          echo "============================================================"
           echo "VERIFY externals/CMakeLists.txt"
-          echo "============================================================"
           grep -n -A3 -B3 "libadrenotools" externals/CMakeLists.txt || true
-
           echo
-          echo "============================================================"
           echo "VERIFY video_core/CMakeLists.txt"
-          echo "============================================================"
           grep -n -A3 -B3 "adrenotools" src/video_core/CMakeLists.txt || true
-
           echo
-          echo "============================================================"
-          echo "VERIFY vk_turbo_mode.cpp"
-          echo "============================================================"
-          grep -n -A4 -B3 "adrenotools" \
-            src/video_core/renderer_vulkan/vk_turbo_mode.cpp || true
-
-          echo
-          echo "============================================================"
           echo "VERIFY vulkan_device.cpp"
-          echo "============================================================"
-          grep -n -A4 -B3 "adrenotools\|bcenabler" \
+          grep -n -A6 -B2 "adrenotools\|bcenabler\|adrenotools_bionic_stub" \
             src/video_core/vulkan_common/vulkan_device.cpp || true
       # ============================================================
       # 19. Headless EmuWindow
