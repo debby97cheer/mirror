@@ -1569,111 +1569,169 @@ jobs:
           echo "PASS: no libandroid.so in SDL3 generated build."
 
       # ============================================================
-      # 24. Generated Build Graph Audit
-      # ============================================================
-      - name: Audit Generated Build Graph
-        shell: bash
-        run: |
-          set -eux
+# 24. Generated Build Graph Audit
+#
+# 注意：
+# CMakeCache.txt 中出现 MEDIANDK_LIBRARY 并不代表最终链接。
+# 因此这里绝对不能直接 grep 整个 build/。
+#
+# 我们只检查：
+#   1. build.ninja
+#   2. *.ninja
+#   3. *.rsp
+#   4. SDL generated build
+#
+# 最终是否真正进入 ELF，则由后面的 readelf -d 再做一次最终确认。
+# ============================================================
+- name: Audit Generated Build Graph
+  shell: bash
+  run: |
+    set -eux
 
-          echo "============================================================"
-          echo "1. No CPM SDL3 cache"
-          echo "============================================================"
+    echo "============================================================"
+    echo "1. No CPM SDL3 cache"
+    echo "============================================================"
 
-          if [ -d ".cache/cpm/sdl3" ] || \
-             [ -d ".cache/cpm/sdl3-ci" ]; then
+    if [ -d ".cache/cpm/sdl3" ] || \
+       [ -d ".cache/cpm/sdl3-ci" ]; then
 
-            echo "ERROR: CPM SDL3 detected."
-            exit 1
-          fi
+      echo "ERROR: CPM SDL3 detected."
+      exit 1
+    fi
 
-          echo "PASS."
+    echo "PASS: No CPM SDL3 cache."
 
-          echo "============================================================"
-          echo "2. No OpenSLES"
-          echo "============================================================"
+    echo
+    echo "============================================================"
+    echo "2. No OpenSLES in actual generated build rules"
+    echo "============================================================"
 
-          if grep -R \
-              -n \
-              -E \
-              -- \
-              '-lOpenSLES\b|libOpenSLES\.so|SDL_openslES\.c\.o' \
-              build \
-              2>/dev/null; then
+    if grep -R \
+        -n \
+        -E \
+        --include='build.ninja' \
+        --include='*.ninja' \
+        --include='*.rsp' \
+        'OpenSLES|libOpenSLES\.so|SDL_openslES\.c\.o' \
+        build \
+        2>/dev/null; then
 
-            echo "ERROR: OpenSLES entered generated build."
-            exit 1
-          fi
+      echo
+      echo "ERROR: OpenSLES entered generated linker/build rules."
+      exit 1
+    fi
 
-          echo "PASS."
+    echo "PASS: No OpenSLES in actual build rules."
 
-          echo "============================================================"
-          echo "3. No JNI_OnLoad forced linker"
-          echo "============================================================"
+    echo
+    echo "============================================================"
+    echo "3. No forced JNI_OnLoad in actual generated build rules"
+    echo "============================================================"
 
-          if grep -R \
-              -n \
-              -- \
-              '-Wl,-u,JNI_OnLoad' \
-              build \
-              2>/dev/null; then
+    if grep -R \
+        -n \
+        -E \
+        --include='build.ninja' \
+        --include='*.ninja' \
+        --include='*.rsp' \
+        -- \
+        '-Wl,-u,JNI_OnLoad' \
+        build \
+        2>/dev/null; then
 
-            echo "ERROR: JNI_OnLoad remains."
-            exit 1
-          fi
+      echo
+      echo "ERROR: Forced JNI_OnLoad remains."
+      exit 1
+    fi
 
-          echo "PASS."
+    echo "PASS: No forced JNI_OnLoad."
 
-          echo "============================================================"
-          echo "4. No MediaNDK"
-          echo "============================================================"
+    echo
+    echo "============================================================"
+    echo "4. No MediaNDK in actual generated build rules"
+    echo "============================================================"
 
-          if grep -R \
-              -n \
-              -E \
-              -- \
-              '-lmediandk\b|libmediandk\.so' \
-              build \
-              2>/dev/null; then
+    if grep -R \
+        -n \
+        -E \
+        --include='build.ninja' \
+        --include='*.ninja' \
+        --include='*.rsp' \
+        '(^|[[:space:]])-lmediandk([[:space:]]|$)|libmediandk\.so' \
+        build \
+        2>/dev/null; then
 
-            echo "ERROR: MediaNDK remains."
-            exit 1
-          fi
+      echo
+      echo "ERROR: MediaNDK appears in actual generated build/link rules."
+      exit 1
+    fi
 
-          echo "PASS."
+    echo "PASS: No MediaNDK in actual build rules."
 
-          echo "============================================================"
-          echo "5. No SDL Android Video backend"
-          echo "============================================================"
+    echo
+    echo "============================================================"
+    echo "5. No SDL Android Video backend"
+    echo "============================================================"
 
-          if grep -R \
-              -n \
-              "src/video/android" \
-              build \
-              2>/dev/null; then
+    if grep -R \
+        -n \
+        --include='build.ninja' \
+        --include='*.ninja' \
+        --include='*.rsp' \
+        'src/video/android' \
+        build \
+        2>/dev/null; then
 
-            echo "ERROR: SDL Android Video backend detected."
-            exit 1
-          fi
+      echo
+      echo "ERROR: SDL Android Video backend detected."
+      exit 1
+    fi
 
-          echo "PASS."
+    echo "PASS: No SDL Android Video backend."
 
-          echo "============================================================"
-          echo "6. No libandroid.so in generated link commands"
-          echo "============================================================"
+    echo
+    echo "============================================================"
+    echo "6. No libandroid.so in actual generated build rules"
+    echo "============================================================"
 
-          if grep -R \
-              -n \
-              -E \
-              '(^|[[:space:]])-landroid([[:space:]]|$)|libandroid\.so' \
-              build \
-              2>/dev/null; then
+    if grep -R \
+        -n \
+        -E \
+        --include='build.ninja' \
+        --include='*.ninja' \
+        --include='*.rsp' \
+        '(^|[[:space:]])-landroid([[:space:]]|$)|libandroid\.so' \
+        build \
+        2>/dev/null; then
 
-            echo "ERROR: libandroid.so entered generated link graph."
-            exit 1
-          fi
+      echo
+      echo "ERROR: libandroid.so entered actual generated link graph."
+      exit 1
+    fi
 
-          echo "PASS."
+    echo "PASS: No libandroid.so in actual build rules."
+
+    echo
+    echo "============================================================"
+    echo "7. Informational: CMake cache variables"
+    echo "============================================================"
+
+    if grep -n \
+        -E \
+        '^(MEDIANDK_LIBRARY|SDL3.*ANDROID|ANDROID.*LIBRARY)' \
+        build/CMakeCache.txt \
+        2>/dev/null; then
+
+      echo
+      echo "NOTE:"
+      echo "These are CMake cache discovery variables only."
+      echo "Their presence does NOT mean they are linked into eden-cli."
+    fi
+
+    echo
+    echo "============================================================"
+    echo "GENERATED BUILD GRAPH AUDIT PASSED"
+    echo "============================================================"
 
       # ============================================================
       # 25. C++20 stop_token test
@@ -1724,104 +1782,106 @@ jobs:
             yuzu-cmd
 
       # ============================================================
-      # 27. ELF Validation
-      #
-      # 这次明确把 libandroid.so 也列为禁止项，
-      # 因为我们的目标就是：
-      #
-      #   Eden native Bionic CLI
-      #   +
-      #   SDL Dummy/Offscreen
-      #
-      # 而不是 SDL Android backend。
-      # ============================================================
-      - name: Verify Pure Bionic ELF
-        shell: bash
-        run: |
-          set -eux
+# 27. ELF Validation
+#
+# 最终真相：
+#   DT_NEEDED
+#
+# CMakeCache.txt 里的变量不作为依据。
+# ============================================================
+- name: Verify Pure Bionic ELF
+  shell: bash
+  run: |
+    set -eux
 
-          BIN="build/bin/eden-cli"
+    BIN="build/bin/eden-cli"
 
-          test -f "$BIN"
+    test -f "$BIN"
 
-          echo "============================================================"
-          echo "ELF"
-          echo "============================================================"
+    echo "============================================================"
+    echo "ELF"
+    echo "============================================================"
 
-          file "$BIN"
+    file "$BIN"
 
-          echo "============================================================"
-          echo "1. Native main"
-          echo "============================================================"
+    echo
+    echo "============================================================"
+    echo "1. Native main"
+    echo "============================================================"
 
-          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
-            -C \
-            "$BIN" \
-            | grep -E '(^| )main$'
+    "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+      -C \
+      "$BIN" \
+      | grep -E '(^| )main$'
 
-          echo "PASS."
+    echo "PASS."
 
-          echo "============================================================"
-          echo "2. DT_NEEDED"
-          echo "============================================================"
+    echo
+    echo "============================================================"
+    echo "2. DT_NEEDED"
+    echo "============================================================"
 
-          readelf -d "$BIN"
+    readelf -d "$BIN"
 
-          echo
-          echo "============================================================"
-          echo "3. Forbidden Android libraries"
-          echo "============================================================"
+    echo
+    echo "============================================================"
+    echo "3. Forbidden Android libraries"
+    echo "============================================================"
 
-          if readelf -d "$BIN" | grep -Ei \
-              'libandroid\.so|OpenSLES|mediandk|android_runtime|gui\.so'; then
+    NEEDED="$(readelf -d "$BIN")"
 
-            echo
-            echo "ERROR: forbidden Android library detected."
-            exit 1
-          fi
+    if printf '%s\n' "$NEEDED" | grep -Ei \
+        'libandroid\.so|libOpenSLES\.so|libmediandk\.so|android_runtime|libgui\.so'; then
 
-          echo "PASS: no forbidden Android libraries."
+      echo
+      echo "ERROR: Forbidden Android library exists in final ELF."
+      exit 1
+    fi
 
-          echo "============================================================"
-          echo "4. Forbidden undefined symbols"
-          echo "============================================================"
+    echo "PASS: No forbidden Android libraries in DT_NEEDED."
 
-          if \
-            "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
-              -u \
-              "$BIN" \
-              | grep -Ei \
-                'slCreateEngine|SL_IID_|JNI_OnLoad|JavaVM'; then
+    echo
+    echo "============================================================"
+    echo "4. Forbidden undefined symbols"
+    echo "============================================================"
 
-            echo
-            echo "ERROR: forbidden Android/JNI/OpenSLES symbol detected."
-            exit 1
-          fi
+    if \
+      "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+        -u \
+        "$BIN" \
+        | grep -Ei \
+          'slCreateEngine|SL_IID_|JNI_OnLoad|JavaVM'; then
 
-          echo "PASS."
+      echo
+      echo "ERROR: Forbidden Android/JNI/OpenSLES symbol detected."
+      exit 1
+    fi
 
-          echo "============================================================"
-          echo "5. Verify no Android Video objects"
-          echo "============================================================"
+    echo "PASS."
 
-          if \
-            "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
-              -C \
-              "$BIN" \
-              | grep -Ei \
-                'SDL_Android|Android_CreateWindow|Android_Video'; then
+    echo
+    echo "============================================================"
+    echo "5. SDL Android Video symbols"
+    echo "============================================================"
 
-            echo
-            echo "ERROR: SDL Android Video symbols detected."
-            exit 1
-          fi
+    if \
+      "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+        -C \
+        "$BIN" \
+        | grep -Ei \
+          'SDL_Android|Android_CreateWindow|Android_Video'; then
 
-          echo "PASS."
+      echo
+      echo "ERROR: SDL Android Video symbols detected."
+      exit 1
+    fi
 
-          echo
-          echo "============================================================"
-          echo "PURE BIONIC ELF VALIDATION PASSED"
-          echo "============================================================"
+    echo "PASS."
+
+    echo
+    echo "============================================================"
+    echo "PURE BIONIC ELF VALIDATION PASSED"
+    echo "============================================================"
 
       # ============================================================
       # 28. Package
