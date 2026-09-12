@@ -15,6 +15,7 @@ jobs:
       SDL_VERSION: release-3.4.8
 
     steps:
+
       # ============================================================
       # 1. 清理 Runner
       # ============================================================
@@ -22,9 +23,11 @@ jobs:
         shell: bash
         run: |
           set -eux
+
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /opt/ghc || true
           sudo rm -rf /usr/local/share/boost || true
+
           df -h
 
       # ============================================================
@@ -43,7 +46,9 @@ jobs:
         shell: bash
         run: |
           set -eux
+
           sudo apt-get update
+
           sudo apt-get install -y \
             cmake \
             ninja-build \
@@ -73,15 +78,17 @@ jobs:
         shell: bash
         run: |
           set -eux
+
           echo "NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 5. 获取 SDL3 源码 (本地源码编译)
+      # 5. Checkout SDL3 3.4.8
       # ============================================================
       - name: Checkout SDL3 Source
         shell: bash
         run: |
           set -eux
+
           rm -rf third_party
           mkdir -p third_party
 
@@ -92,11 +99,293 @@ jobs:
             "$SDL_SOURCE_DIR"
 
           test -f "$SDL_SOURCE_DIR/CMakeLists.txt"
+
           echo "SDL3 commit:"
           git -C "$SDL_SOURCE_DIR" rev-parse HEAD
 
       # ============================================================
-      # 6. Patch 根 CMake (注册 BIONIC_CLI + 净化 FFmpeg 依赖传递)
+      # 6. Patch SDL3
+      #
+      # 核心修复：
+      #
+      # SDL 3.4.8 Android backend 默认会：
+      #
+      #   src/video/android/*
+      #   -landroid
+      #
+      # 这里引入：
+      #
+      #   SDL_BIONIC_NO_ANDROID_VIDEO
+      #
+      # 并彻底关闭 Android Video backend。
+      #
+      # 保留：
+      #
+      #   SDL_VIDEO=ON
+      #   SDL_DUMMYVIDEO=ON
+      #
+      # 因此 Eden 仍然可以初始化 SDL Video subsystem，
+      # 但不再依赖 libandroid.so。
+      # ============================================================
+      - name: Patch SDL3 for Pure Bionic
+        shell: bash
+        run: |
+          set -eux
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("third_party/SDL/CMakeLists.txt")
+          text = path.read_text()
+
+          # --------------------------------------------------------
+          # 6.1 添加 SDL_BIONIC_NO_ANDROID_VIDEO option
+          # --------------------------------------------------------
+
+          option_block = r'''
+          option(
+              SDL_BIONIC_NO_ANDROID_VIDEO
+              "Disable SDL Android Video backend for standalone Bionic builds"
+              OFF
+          )
+          '''
+
+          if "SDL_BIONIC_NO_ANDROID_VIDEO" not in text:
+              marker = "project(SDL3"
+              pos = text.find(marker)
+
+              if pos < 0:
+                  raise SystemExit(
+                      "ERROR: Cannot locate SDL project() declaration."
+                  )
+
+              line_end = text.find("\n", pos)
+
+              text = (
+                  text[:line_end + 1]
+                  + option_block
+                  + "\n"
+                  + text[line_end + 1:]
+              )
+
+              print(
+                  "Added SDL_BIONIC_NO_ANDROID_VIDEO option."
+              )
+          else:
+              print(
+                  "SDL_BIONIC_NO_ANDROID_VIDEO already exists."
+              )
+
+          # --------------------------------------------------------
+          # 6.2 精确定位 Android platform block
+          # --------------------------------------------------------
+
+          android_begin = text.find("if(ANDROID)")
+
+          if android_begin < 0:
+              raise SystemExit(
+                  "ERROR: Cannot locate `if(ANDROID)` in SDL CMakeLists.txt."
+              )
+
+          android_video_begin = text.find(
+              "  if(SDL_VIDEO)",
+              android_begin
+          )
+
+          if android_video_begin < 0:
+              raise SystemExit(
+                  "ERROR: Cannot locate Android SDL_VIDEO block."
+              )
+
+          android_video_end = text.find(
+              "  endif()",
+              android_video_begin
+          )
+
+          if android_video_end < 0:
+              raise SystemExit(
+                  "ERROR: Cannot locate first endif() of Android SDL_VIDEO block."
+              )
+
+          # --------------------------------------------------------
+          # 6.3 更稳妥地找到真正结束位置
+          #
+          # 当前 SDL 3.4.8 Android Video block 结构：
+          #
+          #   if(SDL_VIDEO)
+          #       ...
+          #       if(SDL_OPENGLES)
+          #           ...
+          #       endif()
+          #
+          #       if(SDL_VULKAN)
+          #           ...
+          #           if(VULKAN_PASSED_ANDROID_CHECKS)
+          #               ...
+          #               if(SDL_RENDER_VULKAN)
+          #                   ...
+          #               endif()
+          #           endif()
+          #       endif()
+          #
+          #       ...
+          #   endif()
+          #
+          # 因此这里使用括号深度解析，而不是简单 find().
+          # --------------------------------------------------------
+
+          i = android_video_begin
+          depth = 0
+          end_pos = None
+
+          while i < len(text):
+              line_end = text.find("\n", i)
+
+              if line_end < 0:
+                  line_end = len(text)
+
+              line = text[i:line_end].strip()
+
+              # 忽略注释
+              if not line.startswith("#"):
+                  if line.startswith("if("):
+                      depth += 1
+
+                  elif line.startswith("if ("):
+                      depth += 1
+
+                  elif line.startswith("endif"):
+                      depth -= 1
+
+                      if depth == 0:
+                          end_pos = line_end + 1
+                          break
+
+              i = line_end + 1
+
+          if end_pos is None:
+              raise SystemExit(
+                  "ERROR: Failed to locate end of SDL Android Video block."
+              )
+
+          original_block = text[
+              android_video_begin:end_pos
+          ]
+
+          print("=== Original SDL Android Video block ===")
+          print(original_block)
+
+          # --------------------------------------------------------
+          # 6.4 只在这个 Android Video block 上增加 Bionic guard
+          # --------------------------------------------------------
+
+          patched_block = original_block
+
+          first_if = "  if(SDL_VIDEO)"
+
+          if first_if not in patched_block:
+              raise SystemExit(
+                  "ERROR: Expected SDL Android Video opening if(SDL_VIDEO) missing."
+              )
+
+          patched_block = patched_block.replace(
+              first_if,
+              "  if(SDL_VIDEO AND NOT SDL_BIONIC_NO_ANDROID_VIDEO)",
+              1,
+          )
+
+          text = (
+              text[:android_video_begin]
+              + patched_block
+              + text[end_pos:]
+          )
+
+          # --------------------------------------------------------
+          # 6.5 Bionic 下彻底取消 SDL 强制 JNI_OnLoad
+          # --------------------------------------------------------
+
+          text = text.replace(
+              '''
+            target_link_options(SDL3-static INTERFACE "-Wl,-u,JNI_OnLoad")
+          ''',
+              '''
+            if(NOT SDL_BIONIC_NO_ANDROID_VIDEO)
+              target_link_options(SDL3-static INTERFACE "-Wl,-u,JNI_OnLoad")
+            endif()
+          '''
+          )
+
+          path.write_text(text)
+
+          print(
+              "SDL3 CMake patched successfully."
+          )
+          PY
+
+          echo "============================================================"
+          echo "SDL3 Android Video dependency audit"
+          echo "============================================================"
+
+          grep -n \
+            -A8 \
+            -B4 \
+            "SDL_BIONIC_NO_ANDROID_VIDEO" \
+            "$SDL_SOURCE_DIR/CMakeLists.txt" || true
+
+          echo
+          echo "Checking SDL Android Video backend source references..."
+
+          grep -n \
+            -A12 \
+            -B5 \
+            "src/video/android" \
+            "$SDL_SOURCE_DIR/CMakeLists.txt" || true
+
+      # ============================================================
+      # 7. 清除 cpmfile.json 中 SDL3 预编译包定义
+      # ============================================================
+      - name: Sanitize CPM SDL3 Configuration
+        shell: bash
+        run: |
+          set -eux
+
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          cpm = Path("cpmfile.json")
+
+          if cpm.exists():
+              data = json.loads(cpm.read_text())
+
+              if "sdl3" in data:
+                  del data["sdl3"]
+
+                  cpm.write_text(
+                      json.dumps(data, indent=2) + "\n"
+                  )
+
+                  print(
+                      "Deleted 'sdl3' entry from cpmfile.json."
+                  )
+              else:
+                  print(
+                      "No 'sdl3' entry found in cpmfile.json."
+                  )
+          else:
+              print(
+                  "cpmfile.json not found."
+              )
+          PY
+
+      # ============================================================
+      # 8. Patch 根 CMake
+      #
+      # 注册：
+      #
+      #   YUZU_BIONIC_CLI
+      #
+      # 同时清理 FFmpeg / 第三方库传导的 mediandk。
       # ============================================================
       - name: Patch Root CMake
         shell: bash
@@ -110,22 +399,47 @@ jobs:
           path = Path("CMakeLists.txt")
           text = path.read_text()
 
+          # --------------------------------------------------------
+          # YUZU_CMD
+          # --------------------------------------------------------
+
           pattern = re.compile(
               r'cmake_dependent_option\s*\(\s*YUZU_CMD\b.*?\)',
               re.DOTALL | re.MULTILINE,
           )
-          replacement = 'option(YUZU_CMD "Compile the eden-cli executable" ON)'
-          text, count = pattern.subn(replacement, text, count=1)
+
+          replacement = (
+              'option(YUZU_CMD "Compile the eden-cli executable" ON)'
+          )
+
+          text, count = pattern.subn(
+              replacement,
+              text,
+              count=1,
+          )
 
           if count:
-              print("YUZU_CMD Android restriction removed.")
-          elif 'option(YUZU_CMD "Compile the eden-cli executable" ON)' in text:
-              print("YUZU_CMD already enabled.")
+              print(
+                  "YUZU_CMD Android restriction removed."
+              )
+          elif replacement in text:
+              print(
+                  "YUZU_CMD already enabled."
+              )
           else:
-              raise SystemExit("ERROR: YUZU_CMD declaration not found.")
+              raise SystemExit(
+                  "ERROR: YUZU_CMD declaration not found."
+              )
+
+          # --------------------------------------------------------
+          # YUZU_BIONIC_CLI
+          # --------------------------------------------------------
 
           if "option(YUZU_BIONIC_CLI" not in text:
-              marker = 'option(YUZU_CMD "Compile the eden-cli executable" ON)'
+              marker = (
+                  'option(YUZU_CMD "Compile the eden-cli executable" ON)'
+              )
+
               block = (
                   marker + "\n"
                   'option(YUZU_BIONIC_CLI "Build standalone Android/Bionic CLI" OFF)\n'
@@ -133,87 +447,119 @@ jobs:
                   "    add_compile_definitions(YUZU_BIONIC_CLI)\n"
                   "endif()\n"
               )
-              text = text.replace(marker, block, 1)
 
-          ffmpeg_filter_block = "\n".join([
-              "",
-              "# =========================================================================",
-              "# Bionic CLI: 拦截并剔除第三方库 (如 FFmpeg) 传导的 Android 专属动态库",
-              "# =========================================================================",
-              "if (YUZU_BIONIC_CLI)",
-              "    function(bionic_strip_imported_target _target)",
-              "        if (TARGET ${_target})",
-              "            get_target_property(_aliased ${_target} ALIASED_TARGET)",
-              "            if (_aliased AND NOT _aliased MATCHES \"-NOTFOUND$\")",
-              "                set(_real_target \"${_aliased}\")",
-              "            else()",
-              "                set(_real_target \"${_target}\")",
-              "            endif()",
-              "",
-              "            get_target_property(_is_imported ${_real_target} IMPORTED)",
-              "            set(_props_to_check INTERFACE_LINK_LIBRARIES)",
-              "            if (NOT _is_imported)",
-              "                list(APPEND _props_to_check LINK_LIBRARIES)",
-              "            endif()",
-              "",
-              "            foreach(_prop ${_props_to_check})",
-              "                get_target_property(_libs ${_real_target} ${_prop})",
-              "                if (_libs AND NOT _libs MATCHES \"-NOTFOUND$\")",
-              "                    set(_filtered_libs \"\")",
-              "                    foreach(_lib ${_libs})",
-              "                        if (NOT _lib MATCHES \"mediandk\")",
-              "                            list(APPEND _filtered_libs \"${_lib}\")",
-              "                        else()",
-              "                            message(STATUS \"[BIONIC] Stripped forbidden dependency ${_lib} from ${_real_target} (${_prop})\")",
-              "                        endif()",
-              "                    endforeach()",
-              "                    set_target_properties(${_real_target} PROPERTIES ${_prop} \"${_filtered_libs}\")",
-              "                endif()",
-              "            endforeach()",
-              "        endif()",
-              "    endfunction()",
-              "",
-              "    bionic_strip_imported_target(FFmpeg::FFmpeg)",
-              "    foreach(_comp avcodec avfilter avformat avutil swresample swscale)",
-              "        bionic_strip_imported_target(FFmpeg::${_comp})",
-              "    endforeach()",
-              "    bionic_strip_imported_target(yuzu-cmd)",
-              "    bionic_strip_imported_target(core)",
-              "    bionic_strip_imported_target(common)",
-              "    bionic_strip_imported_target(input_common)",
-              "    bionic_strip_imported_target(video_core)",
-              "endif()",
-              "",
-          ])
+              text = text.replace(
+                  marker,
+                  block,
+                  1,
+              )
+
+              print(
+                  "Added YUZU_BIONIC_CLI."
+              )
+
+          # --------------------------------------------------------
+          # FFmpeg / imported target filtering
+          # --------------------------------------------------------
+
+          ffmpeg_filter_block = "\n".join(
+              [
+                  "",
+                  "# =========================================================================",
+                  "# Bionic CLI: Strip Android-only imported dependencies",
+                  "# =========================================================================",
+                  "if (YUZU_BIONIC_CLI)",
+                  "",
+                  "    function(bionic_strip_imported_target _target)",
+                  "",
+                  "        if (TARGET ${_target})",
+                  "",
+                  "            get_target_property(_aliased ${_target} ALIASED_TARGET)",
+                  "",
+                  "            if (_aliased AND NOT _aliased MATCHES \"-NOTFOUND$\")",
+                  "                set(_real_target \"${_aliased}\")",
+                  "            else()",
+                  "                set(_real_target \"${_target}\")",
+                  "            endif()",
+                  "",
+                  "            get_target_property(_is_imported ${_real_target} IMPORTED)",
+                  "",
+                  "            set(_props_to_check INTERFACE_LINK_LIBRARIES)",
+                  "",
+                  "            if (NOT _is_imported)",
+                  "                list(APPEND _props_to_check LINK_LIBRARIES)",
+                  "            endif()",
+                  "",
+                  "            foreach(_prop ${_props_to_check})",
+                  "",
+                  "                get_target_property(_libs ${_real_target} ${_prop})",
+                  "",
+                  "                if (_libs AND NOT _libs MATCHES \"-NOTFOUND$\")",
+                  "",
+                  "                    set(_filtered_libs \"\")",
+                  "",
+                  "                    foreach(_lib ${_libs})",
+                  "",
+                  "                        if (NOT _lib MATCHES \"mediandk\")",
+                  "                            list(APPEND _filtered_libs \"${_lib}\")",
+                  "                        else()",
+                  "                            message(STATUS \"[BIONIC] Stripped ${_lib} from ${_real_target}\")",
+                  "                        endif()",
+                  "",
+                  "                    endforeach()",
+                  "",
+                  "                    set_target_properties(",
+                  "                        ${_real_target}",
+                  "                        PROPERTIES",
+                  "                        ${_prop}",
+                  "                        \"${_filtered_libs}\"",
+                  "                    )",
+                  "",
+                  "                endif()",
+                  "",
+                  "            endforeach()",
+                  "",
+                  "        endif()",
+                  "",
+                  "    endfunction()",
+                  "",
+                  "    bionic_strip_imported_target(FFmpeg::FFmpeg)",
+                  "",
+                  "    foreach(_comp",
+                  "        avcodec",
+                  "        avfilter",
+                  "        avformat",
+                  "        avutil",
+                  "        swresample",
+                  "        swscale",
+                  "    )",
+                  "        bionic_strip_imported_target(FFmpeg::${_comp})",
+                  "    endforeach()",
+                  "",
+                  "    bionic_strip_imported_target(yuzu-cmd)",
+                  "    bionic_strip_imported_target(core)",
+                  "    bionic_strip_imported_target(common)",
+                  "    bionic_strip_imported_target(input_common)",
+                  "    bionic_strip_imported_target(video_core)",
+                  "",
+                  "endif()",
+                  "",
+              ]
+          )
 
           text += ffmpeg_filter_block
+
           path.write_text(text)
-          print("Root CMake patched with FFmpeg filter.")
+
+          print(
+              "Root CMake patched."
+          )
           PY
 
       # ============================================================
-      # 7. 清除 cpmfile.json 中的 SDL3 预编译包定义
-      # ============================================================
-      - name: Sanitize CPM SDL3 Configuration
-        shell: bash
-        run: |
-          set -eux
-
-          python3 <<'PY'
-          import json
-          from pathlib import Path
-
-          cpm = Path("cpmfile.json")
-          if cpm.exists():
-              data = json.loads(cpm.read_text())
-              if "sdl3" in data:
-                  del data["sdl3"]
-                  cpm.write_text(json.dumps(data, indent=2) + "\n")
-                  print("Deleted 'sdl3' entry from cpmfile.json.")
-          PY
-
-      # ============================================================
-      # 8. 修改 externals/CMakeLists.txt (强制挂载本地源码 SDL3)
+      # 9. 修改 externals/CMakeLists.txt
+      #
+      # 强制使用本地 SDL3 源码。
       # ============================================================
       - name: Patch SDL3 Dependency Routing
         shell: bash
@@ -233,43 +579,87 @@ jobs:
           end = text.find(end_marker)
 
           if start < 0 or end < 0 or end <= start:
-              raise SystemExit("ERROR: Invalid SDL3 dependency block boundaries.")
+              raise SystemExit(
+                  "ERROR: Invalid SDL3 dependency block boundaries."
+              )
 
-          new_block = "\n".join([
-              'message(STATUS "Using EXCLUSIVE local source SDL3 for Bionic CLI")',
-              'set(SDL_AUDIO OFF CACHE BOOL "" FORCE)',
-              'set(SDL_VIDEO ON CACHE BOOL "" FORCE)',
-              'set(SDL_SHARED OFF CACHE BOOL "" FORCE)',
-              'set(SDL_STATIC ON CACHE BOOL "" FORCE)',
-              'set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)',
-              'set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)',
-              'set(SDL_HIDAPI OFF CACHE BOOL "" FORCE)',
-              'set(SDL_SENSOR OFF CACHE BOOL "" FORCE)',
-              'set(SDL_CAMERA OFF CACHE BOOL "" FORCE)',
-              'set(SDL_POWER OFF CACHE BOOL "" FORCE)',
-              'set(SDL_DIALOG OFF CACHE BOOL "" FORCE)',
-              'set(SDL_TRAY OFF CACHE BOOL "" FORCE)',
-              'set(SDL_NOTIFICATION OFF CACHE BOOL "" FORCE)',
-              'set(SDL_OPENGL OFF CACHE BOOL "" FORCE)',
-              'set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)',
-              'set(SDL_DUMMYVIDEO ON CACHE BOOL "" FORCE)',
-              'set(SDL_VULKAN ON CACHE BOOL "" FORCE)',
-              'add_subdirectory("${EDEN_BIONIC_SDL3_SOURCE}" "${CMAKE_BINARY_DIR}/eden_sdl3" EXCLUDE_FROM_ALL)',
-              'if (NOT TARGET SDL3::SDL3)',
-              '    add_library(SDL3::SDL3 ALIAS SDL3-static)',
-              'endif()',
-              '',
-          ])
+          new_block = "\n".join(
+              [
+                  'message(STATUS "Using EXCLUSIVE local source SDL3 for Bionic CLI")',
 
-          text = text[:start] + new_block + text[end:]
+                  'set(SDL_AUDIO OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_VIDEO ON CACHE BOOL "" FORCE)',
+
+                  'set(SDL_SHARED OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_STATIC ON CACHE BOOL "" FORCE)',
+
+                  'set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_HIDAPI OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_SENSOR OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_CAMERA OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_POWER OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_DIALOG OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_TRAY OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_NOTIFICATION OFF CACHE BOOL "" FORCE)',
+
+                  'set(SDL_OPENGL OFF CACHE BOOL "" FORCE)',
+                  'set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)',
+
+                  # --------------------------------------------------
+                  # 保留 SDL Video subsystem，
+                  # 但只需要 Dummy/Offscreen。
+                  # --------------------------------------------------
+
+                  'set(SDL_DUMMYVIDEO ON CACHE BOOL "" FORCE)',
+
+                  # SDL Vulkan API 保持开启。
+                  #
+                  # 注意：
+                  # SDL Android Video backend 本身会被
+                  # SDL_BIONIC_NO_ANDROID_VIDEO 禁用。
+                  #
+
+                  'set(SDL_VULKAN ON CACHE BOOL "" FORCE)',
+
+                  # Android Java package 不需要。
+                  'set(SDL_ANDROID_JAR OFF CACHE BOOL "" FORCE)',
+
+                  # 关键：
+                  'set(SDL_BIONIC_NO_ANDROID_VIDEO ON CACHE BOOL "" FORCE)',
+
+                  'add_subdirectory('
+                  '"${EDEN_BIONIC_SDL3_SOURCE}" '
+                  '"${CMAKE_BINARY_DIR}/eden_sdl3" '
+                  'EXCLUDE_FROM_ALL'
+                  ')',
+
+                  'if (NOT TARGET SDL3::SDL3)',
+                  '    add_library(SDL3::SDL3 ALIAS SDL3-static)',
+                  'endif()',
+
+                  '',
+              ]
+          )
+
+          text = (
+              text[:start]
+              + new_block
+              + text[end:]
+          )
+
           path.write_text(text)
-          print("SDL3 dependency block replaced with exclusive source routing.")
+
+          print(
+              "SDL3 dependency routing patched."
+          )
           PY
 
       # ============================================================
-      # 9. 修改 common/CMakeLists.txt 并注入 fs_android_bionic 存根
+      # 10. 修改 common/CMakeLists.txt
+      #      + Bionic FS source
       # ============================================================
-      - name: Patch Common Android Dependencies & Inject Bionic FS Stub
+      - name: Patch Common Android Dependencies and FS
         shell: bash
         run: |
           set -eux
@@ -285,59 +675,82 @@ jobs:
               r'if\s*\(\s*ANDROID\s*\)(?=[\s\S]*?fs/fs_android\.cpp)',
               'if(ANDROID AND NOT YUZU_BIONIC_CLI)',
               text,
-              count=1
+              count=1,
           )
 
           if "fs_android_bionic.cpp" not in text:
-              text += "\nif (YUZU_BIONIC_CLI)\n    target_sources(common PRIVATE fs/fs_android_bionic.cpp)\nendif()\n"
+              text += (
+                  "\n"
+                  "if (YUZU_BIONIC_CLI)\n"
+                  "    target_sources(common PRIVATE fs/fs_android_bionic.cpp)\n"
+                  "endif()\n"
+              )
 
           path.write_text(text)
 
-          stub_path = Path("src/common/fs/fs_android_bionic.cpp")
+          stub_path = Path(
+              "src/common/fs/fs_android_bionic.cpp"
+          )
+
           stub_path.write_text(
               "// SPDX-FileCopyrightText: 2026 Eden Emulator Project\n"
               "// SPDX-License-Identifier: GPL-3.0-or-later\n\n"
-              "#include <cstdint>\n"
+
               "#include <string>\n"
+
               "#include \"common/common_types.h\"\n"
               "#include \"common/fs/fs_android.h\"\n\n"
+
               "namespace Common::FS::Android {\n\n"
+
               "bool IsContentUri(const std::string& path) {\n"
               "    (void)path;\n"
               "    return false;\n"
               "}\n\n"
+
               "std::string GetFilename(const std::string& path) {\n"
               "    (void)path;\n"
               "    return {};\n"
               "}\n\n"
+
               "std::string GetParentDirectory(const std::string& path) {\n"
               "    (void)path;\n"
               "    return {};\n"
               "}\n\n"
+
               "bool Exists(const std::string& path) {\n"
               "    (void)path;\n"
               "    return false;\n"
               "}\n\n"
+
               "bool IsDirectory(const std::string& path) {\n"
               "    (void)path;\n"
               "    return false;\n"
               "}\n\n"
+
               "u64 GetSize(const std::string& path) {\n"
               "    (void)path;\n"
               "    return 0;\n"
               "}\n\n"
-              "int OpenContentUri(const std::string& filepath, OpenMode open_mode) {\n"
+
+              "int OpenContentUri("
+              "const std::string& filepath, "
+              "OpenMode open_mode) {\n"
               "    (void)filepath;\n"
               "    (void)open_mode;\n"
               "    return -1;\n"
               "}\n\n"
+
               "} // namespace Common::FS::Android\n"
           )
-          print("Common dependencies patched and fs_android_bionic.cpp created.")
+
+          print(
+              "Common Bionic FS implementation ready."
+          )
           PY
 
       # ============================================================
-      # 10. 修改 input_common/CMakeLists.txt
+      # 11. Input Android driver
       # ============================================================
       - name: Patch Input Android Driver
         shell: bash
@@ -348,23 +761,43 @@ jobs:
           from pathlib import Path
           import re
 
-          path = Path("src/input_common/CMakeLists.txt")
+          path = Path(
+              "src/input_common/CMakeLists.txt"
+          )
+
           text = path.read_text()
 
           if "if (ANDROID AND NOT YUZU_BIONIC_CLI)" in text:
-              print("Input Android block already patched.")
+              print(
+                  "Input Android block already patched."
+              )
           else:
-              pattern = re.compile(r'if\s*\(\s*ANDROID\s*\)(?=[\s\S]*?drivers/android\.cpp)', re.MULTILINE)
-              text, count = pattern.subn("if (ANDROID AND NOT YUZU_BIONIC_CLI)", text, count=1)
+              pattern = re.compile(
+                  r'if\s*\(\s*ANDROID\s*\)'
+                  r'(?=[\s\S]*?drivers/android\.cpp)',
+                  re.MULTILINE,
+              )
+
+              text, count = pattern.subn(
+                  "if (ANDROID AND NOT YUZU_BIONIC_CLI)",
+                  text,
+                  count=1,
+              )
+
               if count == 0:
-                  raise SystemExit("ERROR: Could not locate `if (ANDROID)` in src/input_common/CMakeLists.txt")
-              print("Android input driver disabled.")
+                  raise SystemExit(
+                      "ERROR: Could not locate Android input block."
+                  )
+
+              print(
+                  "Android input driver disabled."
+              )
 
           path.write_text(text)
           PY
 
       # ============================================================
-      # 11. 修改 src/CMakeLists.txt
+      # 12. src/CMakeLists.txt
       # ============================================================
       - name: Patch src CMake
         shell: bash
@@ -378,29 +811,46 @@ jobs:
           path = Path("src/CMakeLists.txt")
           text = path.read_text()
 
-          text = re.sub(r'if\s*\(\s*YUZU_CMD\s*\)', 'if (YUZU_CMD OR YUZU_BIONIC_CLI)', text, count=1)
+          text = re.sub(
+              r'if\s*\(\s*YUZU_CMD\s*\)',
+              'if (YUZU_CMD OR YUZU_BIONIC_CLI)',
+              text,
+              count=1,
+          )
+
           pattern_jni = re.compile(
               r'if\s*\(\s*ANDROID\s*\)\s*'
               r'add_subdirectory\s*\(\s*android/app/src/main/jni\s*\)\s*'
-              r'target_include_directories\s*\(\s*yuzu-android\s+PRIVATE\s+android/app/src/main\s*\)\s*'
+              r'target_include_directories\s*\(\s*yuzu-android'
+              r'\s+PRIVATE\s+android/app/src/main\s*\)\s*'
               r'endif\s*\(\s*\)',
-              re.MULTILINE
+              re.MULTILINE,
           )
+
           replacement_jni = (
               "if (ANDROID AND NOT YUZU_BIONIC_CLI)\n"
               "    add_subdirectory(android/app/src/main/jni)\n"
-              "    target_include_directories(yuzu-android PRIVATE android/app/src/main)\n"
+              "    target_include_directories("
+              "yuzu-android PRIVATE android/app/src/main)\n"
               "endif()"
           )
-          text, count = pattern_jni.subn(replacement_jni, text, count=1)
+
+          text, count = pattern_jni.subn(
+              replacement_jni,
+              text,
+              count=1,
+          )
+
           if count:
-              print("Full Android JNI target disabled via regex.")
+              print(
+                  "Android JNI target disabled."
+              )
 
           path.write_text(text)
           PY
 
       # ============================================================
-      # 12. Core mediandk
+      # 13. Core MediaNDK
       # ============================================================
       - name: Patch Core MediaNDK Dependency
         shell: bash
@@ -415,28 +865,49 @@ jobs:
           text = path.read_text()
 
           if "mediandk" in text:
+
               pattern = re.compile(
                   r'if\s*\(\s*ANDROID\s*\)\s*'
                   r'target_link_libraries\s*\(\s*core\s+PRIVATE\s+mediandk\s*\)\s*'
                   r'endif\s*\(\s*\)',
                   re.MULTILINE,
               )
+
               replacement = (
                   "if (ANDROID AND NOT YUZU_BIONIC_CLI)\n"
                   "    target_link_libraries(core PRIVATE mediandk)\n"
                   "endif()"
               )
-              text, count = pattern.subn(replacement, text, count=1)
+
+              text, count = pattern.subn(
+                  replacement,
+                  text,
+                  count=1,
+              )
+
               if count:
-                  print("Core mediandk dependency guarded.")
+                  print(
+                      "Core MediaNDK dependency guarded."
+                  )
               else:
-                  text = text.replace("mediandk", "")
-                  print("Fallback: mediandk removed from core/CMakeLists.txt.")
+                  text = text.replace(
+                      "mediandk",
+                      "",
+                  )
+
+                  print(
+                      "Fallback: mediandk removed."
+                  )
+
               path.write_text(text)
+          else:
+              print(
+                  "No MediaNDK reference found in core."
+              )
           PY
 
       # ============================================================
-      # 13. yuzu_cmd CMake：android_settings.cpp
+      # 14. yuzu_cmd
       # ============================================================
       - name: Patch yuzu-cmd Sources
         shell: bash
@@ -446,21 +917,35 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          path = Path("src/yuzu_cmd/CMakeLists.txt")
+          path = Path(
+              "src/yuzu_cmd/CMakeLists.txt"
+          )
+
           text = path.read_text()
 
           if "android_settings.cpp" not in text:
               marker = "add_executable(yuzu-cmd\n"
+
               if marker not in text:
-                  raise SystemExit("ERROR: yuzu-cmd add_executable() not found.")
+                  raise SystemExit(
+                      "ERROR: yuzu-cmd add_executable() not found."
+                  )
+
               text = text.replace(
                   marker,
-                  marker + "    ../android/app/src/main/jni/android_settings.cpp\n",
+                  marker
+                  + "    ../android/app/src/main/jni/android_settings.cpp\n",
                   1,
               )
-              print("Added android_settings.cpp.")
 
-          if "target_link_libraries(yuzu-cmd PRIVATE log)" not in text:
+              print(
+                  "Added android_settings.cpp."
+              )
+
+          if (
+              "target_link_libraries(yuzu-cmd PRIVATE log)"
+              not in text
+          ):
               text += (
                   "\n"
                   "if (ANDROID AND YUZU_BIONIC_CLI)\n"
@@ -472,7 +957,7 @@ jobs:
           PY
 
       # ============================================================
-      # 14. Input C++ Android guards
+      # 15. Input C++ Android runtime guards
       # ============================================================
       - name: Patch Input Android Runtime Guards
         shell: bash
@@ -482,19 +967,38 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          for filename in ("src/input_common/main.cpp", "src/input_common/main.h"):
+          for filename in (
+              "src/input_common/main.cpp",
+              "src/input_common/main.h",
+          ):
+
               path = Path(filename)
+
               if not path.exists():
                   continue
+
               text = path.read_text()
-              text = text.replace("#ifdef __ANDROID__", "#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)")
-              text = text.replace("#if defined(__ANDROID__)", "#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)")
+
+              text = text.replace(
+                  "#ifdef __ANDROID__",
+                  "#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)",
+              )
+
+              text = text.replace(
+                  "#if defined(__ANDROID__)",
+                  "#if defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)",
+              )
+
               path.write_text(text)
-              print("Patched Android input guards:", filename)
+
+              print(
+                  "Patched:",
+                  filename,
+              )
           PY
 
       # ============================================================
-      # 15. Battery branch
+      # 16. Battery Android runtime branch
       # ============================================================
       - name: Patch Android Battery Runtime
         shell: bash
@@ -504,16 +1008,30 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          path = Path("src/common/device_power_state.cpp")
+          path = Path(
+              "src/common/device_power_state.cpp"
+          )
+
           if path.exists():
               text = path.read_text()
-              text = text.replace("#elif defined(__ANDROID__)", "#elif defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)")
+
+              text = text.replace(
+                  "#elif defined(__ANDROID__)",
+                  "#elif defined(__ANDROID__) && !defined(YUZU_BIONIC_CLI)",
+              )
+
               path.write_text(text)
-              print("Android battery branch disabled.")
+
+              print(
+                  "Android battery branch disabled."
+              )
           PY
 
       # ============================================================
-      # 16. 从 CMake 源码根除全局 -Wl,-u,JNI_OnLoad 强制链接
+      # 17. 全源码清理 JNI_OnLoad
+      #
+      # 注意：
+      # third_party/SDL/CMakeLists.txt 也会被检查。
       # ============================================================
       - name: Strip Forced JNI_OnLoad
         shell: bash
@@ -525,16 +1043,31 @@ jobs:
           import re
 
           for p in Path(".").rglob("CMakeLists.txt"):
-              text = p.read_text()
-              if "JNI_OnLoad" in text:
-                  new = re.sub(r'-Wl,\s*-u,\s*JNI_OnLoad', '', text)
-                  if new != text:
-                      p.write_text(new)
-                      print(f"Stripped -Wl,-u,JNI_OnLoad from {p}")
+
+              try:
+                  text = p.read_text()
+              except UnicodeDecodeError:
+                  continue
+
+              if "JNI_OnLoad" not in text:
+                  continue
+
+              new = re.sub(
+                  r'-Wl,\s*-u,\s*JNI_OnLoad',
+                  '',
+                  text,
+              )
+
+              if new != text:
+                  p.write_text(new)
+
+                  print(
+                      f"Stripped JNI_OnLoad from {p}"
+                  )
           PY
 
       # ============================================================
-      # 17. Headless EmuWindow
+      # 18. Headless EmuWindow
       # ============================================================
       - name: Patch Headless EmuWindow
         shell: bash
@@ -544,63 +1077,144 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          null_cpp = Path("src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp")
+          # --------------------------------------------------------
+          # Null Window implementation
+          # --------------------------------------------------------
+
+          null_cpp = Path(
+              "src/yuzu_cmd/emu_window/emu_window_sdl3_null.cpp"
+          )
+
           null_cpp.write_text(
               "// SPDX-FileCopyrightText: 2026 Eden Emulator Project\n"
               "// SPDX-License-Identifier: GPL-3.0-or-later\n\n"
+
               "#include <iostream>\n"
               "#include <memory>\n\n"
-              "#include \"yuzu_cmd/emu_window/emu_window_sdl3_null.h\"\n\n"
+
+              "#include "
+              "\"yuzu_cmd/emu_window/emu_window_sdl3_null.h\"\n\n"
+
               "EmuWindow_SDL3_Null::EmuWindow_SDL3_Null(\n"
               "    InputCommon::InputSubsystem* input_subsystem,\n"
               "    Core::System& system,\n"
               "    bool fullscreen)\n"
               "    : EmuWindow_SDL3{input_subsystem, system} {\n"
+
               "    (void)fullscreen;\n"
+
               "    is_open = true;\n"
-              "    std::cout << \"[BIONIC] EmuWindow_SDL3_Null: initialized\" << std::endl;\n"
+
+              "    std::cout "
+              "<< \"[BIONIC] EmuWindow_SDL3_Null initialized\" "
+              "<< std::endl;\n"
               "}\n\n"
+
               "EmuWindow_SDL3_Null::~EmuWindow_SDL3_Null() = default;\n\n"
+
               "std::unique_ptr<Core::Frontend::GraphicsContext>\n"
               "EmuWindow_SDL3_Null::CreateSharedContext() const {\n"
               "    return std::make_unique<DummyContext>();\n"
               "}\n"
           )
 
-          base = Path("src/yuzu_cmd/emu_window/emu_window_sdl3.cpp")
-          text = base.read_text()
-          if "#include <iostream>" not in text:
-              text = "#include <iostream>\n" + text
+          # --------------------------------------------------------
+          # Base SDL window
+          # --------------------------------------------------------
 
-          marker = "input_subsystem->Initialize();\n"
-          if "#ifdef YUZU_BIONIC_CLI" not in text:
+          base = Path(
+              "src/yuzu_cmd/emu_window/emu_window_sdl3.cpp"
+          )
+
+          text = base.read_text()
+
+          if "#include <iostream>" not in text:
+              text = (
+                  "#include <iostream>\n"
+                  + text
+              )
+
+          marker = (
+              "input_subsystem->Initialize();\n"
+          )
+
+          if "YUZU_BIONIC_CLI" not in text:
+
               index = text.find(marker)
+
               if index < 0:
-                  raise SystemExit("ERROR: SDL input init marker not found.")
-              insert_pos = index + len(marker)
+                  raise SystemExit(
+                      "ERROR: SDL input init marker not found."
+                  )
+
+              insert_pos = (
+                  index + len(marker)
+              )
+
               headless = (
                   "#ifdef YUZU_BIONIC_CLI\n"
-                  "    std::cout << \"[BIONIC] Headless mode - no physical window\" << std::endl;\n"
+
+                  "    std::cout "
+                  "<< \"[BIONIC] Headless SDL window mode\" "
+                  "<< std::endl;\n"
+
                   "    is_open = true;\n"
                   "    render_window = nullptr;\n"
+
                   "    return;\n"
+
                   "#endif\n"
               )
-              text = text[:insert_pos] + headless + text[insert_pos:]
 
-          dtor = "EmuWindow_SDL3::~EmuWindow_SDL3() {"
-          if dtor in text and "#ifdef YUZU_BIONIC_CLI" not in text[text.find(dtor):text.find(dtor)+500]:
-              text = text.replace(
-                  dtor,
-                  dtor + "\n#ifdef YUZU_BIONIC_CLI\n    if (!render_window) {\n        return;\n    }\n#endif",
-                  1,
+              text = (
+                  text[:insert_pos]
+                  + headless
+                  + text[insert_pos:]
               )
 
+          # --------------------------------------------------------
+          # Destructor protection
+          # --------------------------------------------------------
+
+          dtor = (
+              "EmuWindow_SDL3::~EmuWindow_SDL3() {"
+          )
+
+          dtor_pos = text.find(dtor)
+
+          if dtor_pos >= 0:
+
+              region = text[
+                  dtor_pos:dtor_pos + 600
+              ]
+
+              if "#ifdef YUZU_BIONIC_CLI" not in region:
+
+                  replacement = (
+                      dtor
+                      + "\n"
+                      "#ifdef YUZU_BIONIC_CLI\n"
+                      "    if (!render_window) {\n"
+                      "        return;\n"
+                      "    }\n"
+                      "#endif"
+                  )
+
+                  text = text.replace(
+                      dtor,
+                      replacement,
+                      1,
+                  )
+
           base.write_text(text)
+
+          print(
+              "Headless EmuWindow configured."
+          )
           PY
 
       # ============================================================
-      # 18. Native main + SDL main mode
+      # 19. Native main
       # ============================================================
       - name: Patch Native Main
         shell: bash
@@ -611,23 +1225,44 @@ jobs:
           from pathlib import Path
           import re
 
-          path = Path("src/yuzu_cmd/yuzu.cpp")
+          path = Path(
+              "src/yuzu_cmd/yuzu.cpp"
+          )
+
           text = path.read_text()
 
+          # --------------------------------------------------------
+          # includes
+          # --------------------------------------------------------
+
           if "#include <cstring>" not in text:
-              text = text.replace("#include <string>", "#include <string>\n#include <cstring>", 1)
+              text = text.replace(
+                  "#include <string>",
+                  "#include <string>\n"
+                  "#include <cstring>",
+                  1,
+              )
 
           if "#include <unistd.h>" not in text:
               text = text.replace(
                   "#include <getopt.h>",
-                  "#include <getopt.h>\n#ifndef _MSC_VER\n#include <unistd.h>\n#endif",
+                  "#include <getopt.h>\n"
+                  "#ifndef _MSC_VER\n"
+                  "#include <unistd.h>\n"
+                  "#endif",
                   1,
               )
 
+          # --------------------------------------------------------
+          # SDL main mode
+          # --------------------------------------------------------
+
           pattern = re.compile(
-              r'#define\s+SDL_MAIN_USE_CALLBACKS\s+1\s*\n#include\s+<SDL3/SDL_main\.h>',
+              r'#define\s+SDL_MAIN_USE_CALLBACKS\s+1\s*\n'
+              r'#include\s+<SDL3/SDL_main\.h>',
               re.MULTILINE,
           )
+
           replacement = (
               "#ifdef YUZU_BIONIC_CLI\n"
               "#define SDL_MAIN_HANDLED 1\n"
@@ -636,7 +1271,21 @@ jobs:
               "#endif\n"
               "#include <SDL3/SDL_main.h>"
           )
-          text, count = pattern.subn(replacement, text, count=1)
+
+          text, count = pattern.subn(
+              replacement,
+              text,
+              count=1,
+          )
+
+          if count:
+              print(
+                  "SDL main callback mode converted."
+              )
+
+          # --------------------------------------------------------
+          # getopt fixes
+          # --------------------------------------------------------
 
           text, count = re.subn(
               r'getopt_long\s*\(\s*argc\s*,\s*argv\s*,\s*"[^"]*"',
@@ -644,84 +1293,182 @@ jobs:
               text,
               count=1,
           )
-          text = text.replace('{"input-profile", no_argument, 0, \'i\'},', '{"input-profile", required_argument, 0, \'i\'},')
-          text = text.replace('{"filter", no_argument, 0, \'x\'},', '{"filter", required_argument, 0, \'x\'},')
+
+          text = text.replace(
+              '{"input-profile", no_argument, 0, \'i\'},',
+              '{"input-profile", required_argument, 0, \'i\'},',
+          )
+
+          text = text.replace(
+              '{"filter", no_argument, 0, \'x\'},',
+              '{"filter", required_argument, 0, \'x\'},',
+          )
+
+          # --------------------------------------------------------
+          # Debug trace
+          # --------------------------------------------------------
 
           if "[BIONIC] Step 1:" not in text:
-              text = text.replace("state->system.Initialize();", 'std::cout << "[BIONIC] Step 1: Init System Core..." << std::endl;\n    state->system.Initialize();', 1)
+              text = text.replace(
+                  "state->system.Initialize();",
+                  'std::cout << "[BIONIC] Step 1: Init System Core..." << std::endl;\n'
+                  "    state->system.Initialize();",
+                  1,
+              )
+
           if "[BIONIC] Step 2:" not in text:
-              text = text.replace("state->system.ApplySettings();", 'std::cout << "[BIONIC] Step 2: Apply Settings..." << std::endl;\n    state->system.ApplySettings();', 1)
+              text = text.replace(
+                  "state->system.ApplySettings();",
+                  'std::cout << "[BIONIC] Step 2: Apply Settings..." << std::endl;\n'
+                  "    state->system.ApplySettings();",
+                  1,
+              )
+
           if "[BIONIC] Step 3:" not in text:
-              text = text.replace("state->system.SetContentProvider", 'std::cout << "[BIONIC] Step 3: Filesystem Ready..." << std::endl;\n    state->system.SetContentProvider', 1)
+              text = text.replace(
+                  "state->system.SetContentProvider",
+                  'std::cout << "[BIONIC] Step 3: Filesystem Ready..." << std::endl;\n'
+                  "    state->system.SetContentProvider",
+                  1,
+              )
+
           if "[BIONIC] Step 4:" not in text:
-              text = text.replace("const Core::SystemResultStatus load_result = state->system.Load(", 'std::cout << "[BIONIC] Step 4: Loading ROM..." << std::endl;\n    const Core::SystemResultStatus load_result = state->system.Load(', 1)
+              text = text.replace(
+                  "const Core::SystemResultStatus load_result = state->system.Load(",
+                  'std::cout << "[BIONIC] Step 4: Loading ROM..." << std::endl;\n'
+                  "    const Core::SystemResultStatus load_result = state->system.Load(",
+                  1,
+              )
+
+          # --------------------------------------------------------
+          # Native main
+          # --------------------------------------------------------
 
           if "int main(int argc, char** argv)" not in text:
-              native_main = (
-                  "\n#ifdef YUZU_BIONIC_CLI\n\n"
-                  "int main(int argc, char** argv) {\n"
-                  "    setvbuf(stdout, nullptr, _IONBF, 0);\n"
-                  "    setvbuf(stderr, nullptr, _IONBF, 0);\n\n"
-                  "    if (chdir(\"/data/eden\") != 0) {\n"
-                  "        std::cerr << \"Warning: unable to chdir to /data/eden\" << std::endl;\n"
-                  "    }\n\n"
-                  "    SDL_SetMainReady();\n\n"
-                  "    std::cout << \"[BIONIC] Native main() entered.\" << std::endl;\n\n"
-                  "    void* appstate = nullptr;\n"
-                  "    const SDL_AppResult result = SDL_AppInit(&appstate, argc, argv);\n"
-                  "    std::cout << \"[BIONIC] SDL_AppInit returned \" << static_cast<int>(result) << std::endl;\n\n"
-                  "    if (appstate != nullptr) {\n"
-                  "        SDL_AppQuit(appstate, result);\n"
-                  "    }\n\n"
-                  "    return (result == SDL_APP_CONTINUE || result == SDL_APP_SUCCESS) ? 0 : 1;\n"
-                  "}\n\n"
-                  "#endif\n"
-              )
+
+              native_main = r'''
+          #ifdef YUZU_BIONIC_CLI
+
+          int main(int argc, char** argv) {
+              setvbuf(stdout, nullptr, _IONBF, 0);
+              setvbuf(stderr, nullptr, _IONBF, 0);
+
+              if (chdir("/data/eden") != 0) {
+                  std::cerr
+                      << "Warning: unable to chdir to /data/eden"
+                      << std::endl;
+              }
+
+              SDL_SetMainReady();
+
+              std::cout
+                  << "[BIONIC] Native main() entered."
+                  << std::endl;
+
+              void* appstate = nullptr;
+
+              const SDL_AppResult result =
+                  SDL_AppInit(
+                      &appstate,
+                      argc,
+                      argv
+                  );
+
+              std::cout
+                  << "[BIONIC] SDL_AppInit returned "
+                  << static_cast<int>(result)
+                  << std::endl;
+
+              if (appstate != nullptr) {
+                  SDL_AppQuit(
+                      appstate,
+                      result
+                  );
+              }
+
+              return (
+                  result == SDL_APP_CONTINUE
+                  || result == SDL_APP_SUCCESS
+              ) ? 0 : 1;
+          }
+
+          #endif
+          '''
+
               text += native_main
 
           path.write_text(text)
-          print("Native main() ready.")
+
+          print(
+              "Native main() ready."
+          )
           PY
 
       # ============================================================
-      # 19. C++20 stop_token
+      # 20. C++20 stop_token
       # ============================================================
       - name: Ensure CXX20 stop_token
         shell: bash
         run: |
           set -eux
-          for f in src/common/thread_worker.h src/common/polyfill_thread.h src/common/thread.h; do
+
+          for f in \
+            src/common/thread_worker.h \
+            src/common/polyfill_thread.h \
+            src/common/thread.h
+          do
             if [ -f "$f" ] && ! grep -q '#include <stop_token>' "$f"; then
               sed -i '1i#include <stop_token>' "$f"
             fi
           done
 
       # ============================================================
-      # 20. Source validation (仅拦截不可见控制字符和验证 main 入口)
+      # 21. Source Validation
       # ============================================================
       - name: Validate Patched Sources
         shell: bash
         run: |
           set -eux
 
-          echo "=== Check control characters ==="
+          echo "============================================================"
+          echo "Control character check"
+          echo "============================================================"
+
           if LC_ALL=C grep -RIl $'\001' src/yuzu_cmd 2>/dev/null; then
             echo "ERROR: ASCII 0x01 control character found."
             exit 1
           fi
+
           echo "PASS: no ASCII 0x01."
 
-          echo "=== Check Native main ==="
-          grep -n 'int main(int argc, char\*\* argv)' src/yuzu_cmd/yuzu.cpp
-          echo "PASS: native main() verified."
+          echo "============================================================"
+          echo "Native main check"
+          echo "============================================================"
+
+          grep -n \
+            'int main(int argc, char\*\* argv)' \
+            src/yuzu_cmd/yuzu.cpp
+
+          echo "PASS: native main verified."
+
+          echo "============================================================"
+          echo "SDL Bionic Video option check"
+          echo "============================================================"
+
+          grep -n \
+            "SDL_BIONIC_NO_ANDROID_VIDEO" \
+            third_party/SDL/CMakeLists.txt
+
+          echo "PASS: SDL Bionic Video option exists."
 
       # ============================================================
-      # 21. Configure
+      # 22. Configure CMake
       # ============================================================
       - name: Configure CMake
         shell: bash
         run: |
           set -eux
+
           rm -rf build
 
           cmake \
@@ -758,48 +1505,178 @@ jobs:
             -DYUZU_DOWNLOAD_TIME_ZONE_DATA=ON \
             -DYUZU_LEGACY=ON \
             -DYUZU_ENABLE_LTO=OFF \
+            -DSDL_BIONIC_NO_ANDROID_VIDEO=ON \
             -DCMAKE_CXX_FLAGS="-fexperimental-library" \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed" \
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       # ============================================================
-      # 22. Configure 后构建依赖审计
+      # 23. SDL Configure Result Audit
+      #
+      # 这里是本次最重要的检查。
+      # ============================================================
+      - name: Audit SDL3 Configure
+        shell: bash
+        run: |
+          set -eux
+
+          echo "============================================================"
+          echo "SDL configure result"
+          echo "============================================================"
+
+          grep -R \
+            -n \
+            -E \
+            "SDL_BIONIC_NO_ANDROID_VIDEO|SDL_VIDEO_DRIVER_ANDROID|android_video" \
+            build/eden_sdl3 \
+            2>/dev/null || true
+
+          echo
+          echo "============================================================"
+          echo "Search generated files for Android video backend"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              "src/video/android" \
+              build/eden_sdl3 \
+              2>/dev/null; then
+
+            echo
+            echo "ERROR: SDL Android Video backend entered generated build."
+            exit 1
+          fi
+
+          echo "PASS: SDL Android Video source is absent."
+
+          echo
+          echo "============================================================"
+          echo "Search generated files for -landroid"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              -E \
+              '(^|[[:space:]])-landroid([[:space:]]|$)|libandroid\.so' \
+              build/eden_sdl3 \
+              2>/dev/null; then
+
+            echo
+            echo "ERROR: SDL3 generated build still references libandroid.so."
+            exit 1
+          fi
+
+          echo "PASS: no libandroid.so in SDL3 generated build."
+
+      # ============================================================
+      # 24. Generated Build Graph Audit
       # ============================================================
       - name: Audit Generated Build Graph
         shell: bash
         run: |
           set -eux
 
-          echo "=== 1. 验证没有生成预编译 SDL3 缓存目录 ==="
-          if [ -d ".cache/cpm/sdl3" ] || [ -d ".cache/cpm/sdl3-ci" ]; then
-            echo "ERROR: CPM Android SDL3 directory detected in .cache/cpm!"
-            exit 1
-          fi
-          echo "PASS: No CPM Android SDL3 directory."
+          echo "============================================================"
+          echo "1. No CPM SDL3 cache"
+          echo "============================================================"
 
-          echo "=== 2. 验证 build.ninja 中没有实际链接 OpenSLES ==="
-          if grep -E -- '-lOpenSLES\b|libOpenSLES\.so|SDL_openslES\.c\.o' build/build.ninja 2>/dev/null; then
-            echo "ERROR: OpenSLES entered build.ninja."
-            exit 1
-          fi
-          echo "PASS: no OpenSLES in build.ninja."
+          if [ -d ".cache/cpm/sdl3" ] || \
+             [ -d ".cache/cpm/sdl3-ci" ]; then
 
-          echo "=== 3. 验证 build.ninja 中没有残留 -Wl,-u,JNI_OnLoad ==="
-          if grep -E -- '-Wl,-u,JNI_OnLoad' build/build.ninja 2>/dev/null; then
-            echo "ERROR: Forced JNI_OnLoad remains in build.ninja."
+            echo "ERROR: CPM SDL3 detected."
             exit 1
           fi
-          echo "PASS: no JNI_OnLoad in build.ninja."
 
-          echo "=== 4. 验证 build.ninja 中没有实际链接 MediaNDK ==="
-          if grep -E -- '-lmediandk\b|libmediandk\.so' build/build.ninja 2>/dev/null; then
-            echo "ERROR: MediaNDK remains in build.ninja."
+          echo "PASS."
+
+          echo "============================================================"
+          echo "2. No OpenSLES"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              -E \
+              -- \
+              '-lOpenSLES\b|libOpenSLES\.so|SDL_openslES\.c\.o' \
+              build \
+              2>/dev/null; then
+
+            echo "ERROR: OpenSLES entered generated build."
             exit 1
           fi
-          echo "PASS: no MediaNDK in build.ninja."
+
+          echo "PASS."
+
+          echo "============================================================"
+          echo "3. No JNI_OnLoad forced linker"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              -- \
+              '-Wl,-u,JNI_OnLoad' \
+              build \
+              2>/dev/null; then
+
+            echo "ERROR: JNI_OnLoad remains."
+            exit 1
+          fi
+
+          echo "PASS."
+
+          echo "============================================================"
+          echo "4. No MediaNDK"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              -E \
+              -- \
+              '-lmediandk\b|libmediandk\.so' \
+              build \
+              2>/dev/null; then
+
+            echo "ERROR: MediaNDK remains."
+            exit 1
+          fi
+
+          echo "PASS."
+
+          echo "============================================================"
+          echo "5. No SDL Android Video backend"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              "src/video/android" \
+              build \
+              2>/dev/null; then
+
+            echo "ERROR: SDL Android Video backend detected."
+            exit 1
+          fi
+
+          echo "PASS."
+
+          echo "============================================================"
+          echo "6. No libandroid.so in generated link commands"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              -E \
+              '(^|[[:space:]])-landroid([[:space:]]|$)|libandroid\.so' \
+              build \
+              2>/dev/null; then
+
+            echo "ERROR: libandroid.so entered generated link graph."
+            exit 1
+          fi
+
+          echo "PASS."
 
       # ============================================================
-      # 23. C++20 test
+      # 25. C++20 stop_token test
       # ============================================================
       - name: Verify CXX20 stop_token
         shell: bash
@@ -830,66 +1707,163 @@ jobs:
           file /tmp/test_cpp20
 
       # ============================================================
-      # 24. Build
+      # 26. Build
       # ============================================================
       - name: Build Eden CLI
         shell: bash
         run: |
           set -eux
+
           echo "============================================================"
           echo "Building eden-cli"
           echo "============================================================"
-          ninja -C build -j"$(nproc)" yuzu-cmd
+
+          ninja \
+            -C build \
+            -j"$(nproc)" \
+            yuzu-cmd
 
       # ============================================================
-      # 25. ELF Validation (仅精准拦截 Java 运行时与 JNI)
+      # 27. ELF Validation
+      #
+      # 这次明确把 libandroid.so 也列为禁止项，
+      # 因为我们的目标就是：
+      #
+      #   Eden native Bionic CLI
+      #   +
+      #   SDL Dummy/Offscreen
+      #
+      # 而不是 SDL Android backend。
       # ============================================================
       - name: Verify Pure Bionic ELF
         shell: bash
         run: |
           set -eux
+
           BIN="build/bin/eden-cli"
+
           test -f "$BIN"
+
+          echo "============================================================"
+          echo "ELF"
+          echo "============================================================"
+
           file "$BIN"
 
-          echo "=== 1. 验证存在原生 main() 入口 ==="
-          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -C "$BIN" | grep -E '(^| )main$'
+          echo "============================================================"
+          echo "1. Native main"
+          echo "============================================================"
 
-          echo "=== 2. 验证 DT_NEEDED 动态链接库清单 ==="
+          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+            -C \
+            "$BIN" \
+            | grep -E '(^| )main$'
+
+          echo "PASS."
+
+          echo "============================================================"
+          echo "2. DT_NEEDED"
+          echo "============================================================"
+
           readelf -d "$BIN"
-          # 仅拦截真正包含 Java VM 框架/私有界面的库，libandroid.so 是纯正的 NDK C 系统库，完全合法
-          if readelf -d "$BIN" | grep -Ei 'OpenSLES|mediandk|android_runtime|gui\.so'; then
-            echo "ERROR: forbidden Android Java/media framework dynamic library detected."
+
+          echo
+          echo "============================================================"
+          echo "3. Forbidden Android libraries"
+          echo "============================================================"
+
+          if readelf -d "$BIN" | grep -Ei \
+              'libandroid\.so|OpenSLES|mediandk|android_runtime|gui\.so'; then
+
+            echo
+            echo "ERROR: forbidden Android library detected."
             exit 1
           fi
 
-          echo "=== 3. 验证未定义符号中不存在任何 Java/JNI/OpenSLES 依赖 ==="
-          if "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -u "$BIN" | grep -Ei 'slCreateEngine|SL_IID_|JNI_OnLoad|JavaVM'; then
-            echo "ERROR: forbidden Android JNI/OpenSLES runtime symbol detected."
+          echo "PASS: no forbidden Android libraries."
+
+          echo "============================================================"
+          echo "4. Forbidden undefined symbols"
+          echo "============================================================"
+
+          if \
+            "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+              -u \
+              "$BIN" \
+              | grep -Ei \
+                'slCreateEngine|SL_IID_|JNI_OnLoad|JavaVM'; then
+
+            echo
+            echo "ERROR: forbidden Android/JNI/OpenSLES symbol detected."
             exit 1
           fi
-          echo "PASS: 100% Pure Bionic ELF validation passed."
+
+          echo "PASS."
+
+          echo "============================================================"
+          echo "5. Verify no Android Video objects"
+          echo "============================================================"
+
+          if \
+            "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+              -C \
+              "$BIN" \
+              | grep -Ei \
+                'SDL_Android|Android_CreateWindow|Android_Video'; then
+
+            echo
+            echo "ERROR: SDL Android Video symbols detected."
+            exit 1
+          fi
+
+          echo "PASS."
+
+          echo
+          echo "============================================================"
+          echo "PURE BIONIC ELF VALIDATION PASSED"
+          echo "============================================================"
 
       # ============================================================
-      # 26. Package
+      # 28. Package
       # ============================================================
       - name: Package Eden Bionic ARM64
         shell: bash
         run: |
           set -eux
-          rm -rf output_bin && mkdir -p output_bin
-          cp build/bin/eden-cli output_bin/eden-cli
+
+          rm -rf output_bin
+          mkdir -p output_bin
+
+          cp \
+            build/bin/eden-cli \
+            output_bin/eden-cli
 
           LIBCXX="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+
           test -f "$LIBCXX"
-          cp "$LIBCXX" output_bin/libc++_shared.so
+
+          cp \
+            "$LIBCXX" \
+            output_bin/libc++_shared.so
 
           file output_bin/*
-          tar -czf eden-bionic-arm64.tar.gz -C output_bin .
+
+          echo "============================================================"
+          echo "Final package"
+          echo "============================================================"
+
+          ls -lh output_bin/
+
+          tar \
+            -czf \
+            eden-bionic-arm64.tar.gz \
+            -C output_bin \
+            .
+
           ls -lh eden-bionic-arm64.tar.gz
 
       # ============================================================
-      # 27. Upload
+      # 29. Upload
       # ============================================================
       - name: Upload Eden Bionic ARM64
         uses: actions/upload-artifact@v4
