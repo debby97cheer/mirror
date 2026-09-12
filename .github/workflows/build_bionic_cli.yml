@@ -1067,7 +1067,258 @@ jobs:
           PY
 
       # ============================================================
-      # 18. Headless EmuWindow
+      # 18. 切断 Eden Android AdrenoTools / LinkerNSBypass
+      #
+      # 根因：
+      #
+      #   video_core
+      #       ↓
+      #   adrenotools
+      #       ↓
+      #   linkernsbypass
+      #       ↓
+      #   -landroid
+      #
+      # Recovery Bionic Null Renderer 阶段不需要：
+      #   - adrenotools
+      #   - linkernsbypass
+      #   - Android linker namespace hook
+      #   - custom Android Vulkan driver injection
+      #
+      # Vulkan 会在下一阶段由我们自己的 Bionic Vulkan 路径处理。
+      # ============================================================
+      - name: Disable Android AdrenoTools for Bionic CLI
+        shell: bash
+        run: |
+          set -eux
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          # --------------------------------------------------------
+          # 1. externals/CMakeLists.txt
+          #
+          # 禁止下载/构建 libadrenotools
+          # --------------------------------------------------------
+
+          path = Path("externals/CMakeLists.txt")
+          text = path.read_text()
+
+          old = """if (ANDROID AND ARCHITECTURE_arm64)
+    AddJsonPackage(libadrenotools)
+endif()"""
+
+          new = """if (ANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)
+    AddJsonPackage(libadrenotools)
+endif()"""
+
+          if old in text:
+              text = text.replace(old, new, 1)
+              print(
+                  "Patched externals/CMakeLists.txt:"
+                  " libadrenotools disabled for Bionic CLI."
+              )
+          elif new in text:
+              print(
+                  "externals/CMakeLists.txt already patched."
+              )
+          else:
+              raise SystemExit(
+                  "ERROR: Could not locate libadrenotools CMake block."
+              )
+
+          path.write_text(text)
+
+          # --------------------------------------------------------
+          # 2. src/video_core/CMakeLists.txt
+          #
+          # 禁止 video_core -> adrenotools
+          # --------------------------------------------------------
+
+          path = Path("src/video_core/CMakeLists.txt")
+          text = path.read_text()
+
+          old_variants = [
+              """if (ANDROID AND ARCHITECTURE_arm64)
+    target_link_libraries(video_core PRIVATE adrenotools)
+endif()""",
+
+              """if(ANDROID AND ARCHITECTURE_arm64)
+    target_link_libraries(video_core PRIVATE adrenotools)
+endif()""",
+          ]
+
+          new = """if (ANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)
+    target_link_libraries(video_core PRIVATE adrenotools)
+endif()"""
+
+          patched = False
+
+          for old in old_variants:
+              if old in text:
+                  text = text.replace(old, new, 1)
+                  patched = True
+                  print(
+                      "Patched video_core -> adrenotools dependency."
+                  )
+                  break
+
+          if not patched and new not in text:
+              raise SystemExit(
+                  "ERROR: Could not locate video_core adrenotools dependency."
+              )
+
+          path.write_text(text)
+
+          # --------------------------------------------------------
+          # 3. src/video_core/renderer_vulkan/vk_turbo_mode.cpp
+          #
+          # Bionic CLI 不允许 include/call adrenotools
+          # --------------------------------------------------------
+
+          path = Path(
+              "src/video_core/renderer_vulkan/vk_turbo_mode.cpp"
+          )
+
+          text = path.read_text()
+
+          old_include = """#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
+
+#include <adrenotools/driver.h>
+
+#endif"""
+
+          new_include = """#if defined(__ANDROID__) && \
+defined(ARCHITECTURE_arm64) && \
+!defined(YUZU_BIONIC_CLI)
+
+#include <adrenotools/driver.h>
+
+#endif"""
+
+          if old_include in text:
+              text = text.replace(
+                  old_include,
+                  new_include,
+                  1,
+              )
+              print(
+                  "Patched vk_turbo_mode include."
+              )
+          elif "YUZU_BIONIC_CLI" in text:
+              print(
+                  "vk_turbo_mode already contains Bionic guard."
+              )
+          else:
+              raise SystemExit(
+                  "ERROR: Could not locate vk_turbo_mode adrenotools include."
+              )
+
+          # --------------------------------------------------------
+          # Replace three Android/adrenotools conditions.
+          #
+          # 1. set_turbo(true)
+          # 2. set_turbo(false)
+          # --------------------------------------------------------
+
+          text = text.replace(
+              """#ifdef __ANDROID__
+
+#ifdef ARCHITECTURE_arm64
+
+adrenotools_set_turbo(true);
+
+#endif
+
+#else""",
+              """#if defined(__ANDROID__) && \
+defined(ARCHITECTURE_arm64) && \
+!defined(YUZU_BIONIC_CLI)
+
+adrenotools_set_turbo(true);
+
+#else""",
+              1,
+          )
+
+          text = text.replace(
+              """#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
+
+adrenotools_set_turbo(false);
+
+#endif""",
+              """#if defined(__ANDROID__) && \
+defined(ARCHITECTURE_arm64) && \
+!defined(YUZU_BIONIC_CLI)
+
+adrenotools_set_turbo(false);
+
+#endif""",
+              1,
+          )
+
+          # 兼容当前 Eden 可能已经采用单层 #if 的版本
+          text = text.replace(
+              """#ifdef ANDROID
+adrenotools_set_turbo(true);
+#else""",
+              """#if defined(ANDROID) && \
+defined(ARCHITECTURE_arm64) && \
+!defined(YUZU_BIONIC_CLI)
+adrenotools_set_turbo(true);
+#else""",
+              1,
+          )
+
+          text = text.replace(
+              """#ifdef ANDROID
+adrenotools_set_turbo(false);
+#endif""",
+              """#if defined(ANDROID) && \
+defined(ARCHITECTURE_arm64) && \
+!defined(YUZU_BIONIC_CLI)
+adrenotools_set_turbo(false);
+#endif""",
+              1,
+          )
+
+          path.write_text(text)
+
+          print(
+              "vk_turbo_mode.cpp patched."
+          )
+          PY
+
+          echo
+          echo "============================================================"
+          echo "Verify AdrenoTools source guards"
+          echo "============================================================"
+
+          echo "--- externals/CMakeLists.txt ---"
+          grep -n \
+            -A3 \
+            -B3 \
+            "libadrenotools" \
+            externals/CMakeLists.txt || true
+
+          echo
+          echo "--- video_core/CMakeLists.txt ---"
+          grep -n \
+            -A3 \
+            -B3 \
+            "adrenotools" \
+            src/video_core/CMakeLists.txt || true
+
+          echo
+          echo "--- vk_turbo_mode.cpp ---"
+          grep -n \
+            -A5 \
+            -B3 \
+            "adrenotools" \
+            src/video_core/renderer_vulkan/vk_turbo_mode.cpp || true
+
+      # ============================================================
+      # 19. Headless EmuWindow
       # ============================================================
       - name: Patch Headless EmuWindow
         shell: bash
@@ -1214,7 +1465,7 @@ jobs:
           PY
 
       # ============================================================
-      # 19. Native main
+      # 20. Native main
       # ============================================================
       - name: Patch Native Main
         shell: bash
@@ -1405,7 +1656,7 @@ jobs:
           PY
 
       # ============================================================
-      # 20. C++20 stop_token
+      # 21. C++20 stop_token
       # ============================================================
       - name: Ensure CXX20 stop_token
         shell: bash
@@ -1423,7 +1674,7 @@ jobs:
           done
 
       # ============================================================
-      # 21. Source Validation
+      # 22. Source Validation
       # ============================================================
       - name: Validate Patched Sources
         shell: bash
@@ -1462,7 +1713,7 @@ jobs:
           echo "PASS: SDL Bionic Video option exists."
 
       # ============================================================
-      # 22. Configure CMake
+      # 23. Configure CMake
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -1487,6 +1738,7 @@ jobs:
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DYUZU_CMD=ON \
             -DYUZU_BIONIC_CLI=ON \
+            -DENABLE_LSFG=OFF \
             -DYUZU_USE_BUNDLED_SDL3=OFF \
             -DEDEN_BIONIC_SDL3_SOURCE="$SDL_SOURCE_DIR" \
             -DENABLE_QT=OFF \
@@ -1511,7 +1763,7 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--as-needed"
 
       # ============================================================
-      # 23. SDL Configure Result Audit
+      # 24. SDL Configure Result Audit
       #
       # 这里是本次最重要的检查。
       # ============================================================
@@ -1568,8 +1820,101 @@ jobs:
 
           echo "PASS: no libandroid.so in SDL3 generated build."
 
-           # ============================================================
-      # 24. Generated Build Graph Audit
+      # ============================================================
+      # 25. AdrenoTools / LinkerNSBypass dependency audit
+      # ============================================================
+      - name: Audit Android GPU Hook Dependencies
+        shell: bash
+        run: |
+          set -eux
+
+          echo "============================================================"
+          echo "1. libadrenotools must NOT be configured"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              --include='*.ninja' \
+              --include='build.ninja' \
+              "libadrenotools" \
+              build \
+              2>/dev/null; then
+
+            echo
+            echo "ERROR: libadrenotools is still present in generated build."
+            exit 1
+          fi
+
+          echo "PASS: no libadrenotools."
+
+          echo
+          echo "============================================================"
+          echo "2. linkernsbypass must NOT be configured"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              --include='*.ninja' \
+              --include='build.ninja' \
+              "linkernsbypass" \
+              build \
+              2>/dev/null; then
+
+            echo
+            echo "ERROR: linkernsbypass is still present."
+            exit 1
+          fi
+
+          echo "PASS: no linkernsbypass."
+
+          echo
+          echo "============================================================"
+          echo "3. no -landroid"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              -E \
+              --include='*.ninja' \
+              --include='build.ninja' \
+              '(^|[[:space:]])-landroid([[:space:]]|$)|libandroid\.so' \
+              build \
+              2>/dev/null; then
+
+            echo
+            echo "ERROR: -landroid/libandroid.so is present."
+            exit 1
+          fi
+
+          echo "PASS: no -landroid."
+
+          echo
+          echo "============================================================"
+          echo "4. video_core must NOT reference adrenotools"
+          echo "============================================================"
+
+          if grep -R \
+              -n \
+              --include='*.ninja' \
+              --include='build.ninja' \
+              "adrenotools" \
+              build/src/video_core \
+              2>/dev/null; then
+
+            echo
+            echo "ERROR: video_core still references adrenotools."
+            exit 1
+          fi
+
+          echo "PASS: video_core is clean."
+
+          echo
+          echo "============================================================"
+          echo "Android GPU hook dependency audit PASSED"
+          echo "============================================================"
+
+      # ============================================================
+      # 26. Generated Build Graph Audit
       #
       # 注意：
       # CMakeCache.txt 中出现 MEDIANDK_LIBRARY 并不代表最终链接。
@@ -1734,7 +2079,7 @@ jobs:
           echo "============================================================"
 
       # ============================================================
-      # 25. C++20 stop_token test
+      # 27. C++20 stop_token test
       # ============================================================
       - name: Verify CXX20 stop_token
         shell: bash
@@ -1765,7 +2110,7 @@ jobs:
           file /tmp/test_cpp20
 
       # ============================================================
-      # 26. Build
+      # 28. Build
       # ============================================================
       - name: Build Eden CLI
         shell: bash
@@ -1781,8 +2126,8 @@ jobs:
             -j"$(nproc)" \
             yuzu-cmd
 
-           # ============================================================
-      # 27. ELF Validation
+      # ============================================================
+      # 29. ELF Validation
       #
       # 最终真相：
       #   DT_NEEDED
@@ -1884,7 +2229,7 @@ jobs:
           echo "============================================================"
 
       # ============================================================
-      # 28. Package
+      # 30. Package
       # ============================================================
       - name: Package Eden Bionic ARM64
         shell: bash
@@ -1923,7 +2268,7 @@ jobs:
           ls -lh eden-bionic-arm64.tar.gz
 
       # ============================================================
-      # 29. Upload
+      # 31. Upload
       # ============================================================
       - name: Upload Eden Bionic ARM64
         uses: actions/upload-artifact@v4
