@@ -1066,10 +1066,10 @@ jobs:
                   )
           PY
 
-      # ============================================================
+       # ============================================================
       # 18. 切断 Eden Android AdrenoTools / LinkerNSBypass
       #
-      # 根因：
+      # 真实依赖链：
       #
       #   video_core
       #       ↓
@@ -1079,13 +1079,10 @@ jobs:
       #       ↓
       #   -landroid
       #
-      # Recovery Bionic Null Renderer 阶段不需要：
-      #   - adrenotools
-      #   - linkernsbypass
-      #   - Android linker namespace hook
-      #   - custom Android Vulkan driver injection
+      # Recovery Bionic CLI / Null Renderer 阶段不需要
+      # AdrenoTools 的 driver injection / namespace hook。
       #
-      # Vulkan 会在下一阶段由我们自己的 Bionic Vulkan 路径处理。
+      # 本步骤采用“宽松匹配”，不再依赖精确字符串。
       # ============================================================
       - name: Disable Android AdrenoTools for Bionic CLI
         shell: bash
@@ -1094,12 +1091,11 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
+          import re
 
-          # --------------------------------------------------------
+          # ========================================================
           # 1. externals/CMakeLists.txt
-          #
-          # 禁止下载/构建 libadrenotools
-          # --------------------------------------------------------
+          # ========================================================
 
           path = Path("externals/CMakeLists.txt")
           text = path.read_text()
@@ -1118,42 +1114,28 @@ jobs:
 
           if old in text:
               text = text.replace(old, new, 1)
-              print(
-                  "Patched externals/CMakeLists.txt:"
-                  " libadrenotools disabled for Bionic CLI."
-              )
+              print("[BIONIC] externals: disabled libadrenotools.")
           elif new in text:
-              print(
-                  "externals/CMakeLists.txt already patched."
-              )
+              print("[BIONIC] externals: already disabled.")
           else:
               raise SystemExit(
-                  "ERROR: Could not locate libadrenotools CMake block."
+                  "ERROR: externals libadrenotools block not found."
               )
 
           path.write_text(text)
 
-          # --------------------------------------------------------
+          # ========================================================
           # 2. src/video_core/CMakeLists.txt
-          #
-          # 禁止 video_core -> adrenotools
-          # --------------------------------------------------------
+          # ========================================================
 
           path = Path("src/video_core/CMakeLists.txt")
           text = path.read_text()
 
-          old_variants = [
-              (
-                  "if (ANDROID AND ARCHITECTURE_arm64)\n"
-                  "    target_link_libraries(video_core PRIVATE adrenotools)\n"
-                  "endif()"
-              ),
-              (
-                  "if(ANDROID AND ARCHITECTURE_arm64)\n"
-                  "    target_link_libraries(video_core PRIVATE adrenotools)\n"
-                  "endif()"
-              ),
-          ]
+          old = (
+              "if (ANDROID AND ARCHITECTURE_arm64)\n"
+              "    target_link_libraries(video_core PRIVATE adrenotools)\n"
+              "endif()"
+          )
 
           new = (
               "if (ANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)\n"
@@ -1161,29 +1143,23 @@ jobs:
               "endif()"
           )
 
-          patched = False
-
-          for old in old_variants:
-              if old in text:
-                  text = text.replace(old, new, 1)
-                  patched = True
-                  print(
-                      "Patched video_core -> adrenotools dependency."
-                  )
-                  break
-
-          if not patched and new not in text:
+          if old in text:
+              text = text.replace(old, new, 1)
+              print("[BIONIC] video_core: disabled adrenotools link.")
+          elif new in text:
+              print("[BIONIC] video_core: already disabled.")
+          else:
               raise SystemExit(
-                  "ERROR: Could not locate video_core adrenotools dependency."
+                  "ERROR: video_core adrenotools block not found."
               )
 
           path.write_text(text)
 
-          # --------------------------------------------------------
-          # 3. src/video_core/renderer_vulkan/vk_turbo_mode.cpp
+          # ========================================================
+          # 3. vk_turbo_mode.cpp
           #
-          # Bionic CLI 不允许 include/call adrenotools
-          # --------------------------------------------------------
+          # 关键改动：全部用正则宽松匹配
+          # ========================================================
 
           path = Path(
               "src/video_core/renderer_vulkan/vk_turbo_mode.cpp"
@@ -1191,145 +1167,122 @@ jobs:
 
           text = path.read_text()
 
-          old_include = (
-              "#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)\n"
-              "\n"
-              "#include <adrenotools/driver.h>\n"
-              "\n"
-              "#endif"
+          # -------- 3A. include guard ------------------------------
+
+          include_pat = re.compile(
+              r'(#if\s+defined\s*\(\s*__ANDROID__\s*\)\s*'
+              r'&&\s*defined\s*\(\s*ARCHITECTURE_arm64\s*\)\s*)'
+              r'(?=\r?\n\s*#include\s*<adrenotools/driver\.h>)',
+              re.MULTILINE,
           )
 
-          new_include = (
-              "#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
-              "\n"
-              "#include <adrenotools/driver.h>\n"
-              "\n"
-              "#endif"
-          )
+          def include_replacer(m):
+              return (
+                  "#if defined(__ANDROID__) && "
+                  "defined(ARCHITECTURE_arm64) && "
+                  "!defined(YUZU_BIONIC_CLI)"
+              )
 
-          if old_include in text:
-              text = text.replace(
-                  old_include,
-                  new_include,
-                  1,
-              )
-              print(
-                  "Patched vk_turbo_mode include."
-              )
-          elif "YUZU_BIONIC_CLI" in text:
-              print(
-                  "vk_turbo_mode already contains Bionic guard."
-              )
+          if "!defined(YUZU_BIONIC_CLI)" in text and \
+             "adrenotools/driver.h" in text and \
+             "!defined(YUZU_BIONIC_CLI)\n#include <adrenotools/driver.h>" in text:
+              print("[BIONIC] include already guarded.")
+          elif include_pat.search(text):
+              text = include_pat.sub(include_replacer, text, count=1)
+              print("[BIONIC] include guard patched.")
           else:
               raise SystemExit(
-                  "ERROR: Could not locate vk_turbo_mode adrenotools include."
+                  "ERROR: include guard pattern not found. "
+                  "Dumping lines containing 'adrenotools':\n"
+                  + "\n".join(
+                      f"  L{i}: {ln}"
+                      for i, ln in enumerate(text.splitlines(), 1)
+                      if "adrenotools" in ln
+                  )
               )
 
-          # --------------------------------------------------------
-          # Replace Android/adrenotools turbo conditions.
-          #
-          # 1. set_turbo(true)
-          # 2. set_turbo(false)
-          # --------------------------------------------------------
+          # -------- 3B. turbo ON -----------------------------------
 
-          old_true_v1 = (
-              "#ifdef __ANDROID__\n"
-              "\n"
-              "#ifdef ARCHITECTURE_arm64\n"
-              "\n"
-              "adrenotools_set_turbo(true);\n"
-              "\n"
-              "#endif\n"
-              "\n"
-              "#else"
+          turbo_on_pat = re.compile(
+              r'#ifdef\s+__ANDROID__\s*\r?\n'
+              r'(\s*)#ifdef\s+ARCHITECTURE_arm64\s*\r?\n'
+              r'(\s*adrenotools_set_turbo\s*\(\s*true\s*\)\s*;)',
+              re.MULTILINE,
           )
 
-          new_true_v1 = (
-              "#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
-              "\n"
-              "adrenotools_set_turbo(true);\n"
-              "\n"
-              "#else"
+          def turbo_on_replacer(m):
+              indent = m.group(1)
+              call = m.group(2)
+              return (
+                  "#ifdef __ANDROID__\n"
+                  + indent
+                  + "#if defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
+                  + indent
+                  + call
+              )
+
+          if "ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n" in text and \
+             "adrenotools_set_turbo(true)" in text and \
+             "defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)" in text:
+              print("[BIONIC] turbo(true) already guarded.")
+          elif turbo_on_pat.search(text):
+              text = turbo_on_pat.sub(turbo_on_replacer, text, count=1)
+              print("[BIONIC] turbo(true) patched.")
+          else:
+              raise SystemExit(
+                  "ERROR: turbo(true) pattern not found. "
+                  "Dumping lines containing 'adrenotools_set_turbo':\n"
+                  + "\n".join(
+                      f"  L{i}: {ln}"
+                      for i, ln in enumerate(text.splitlines(), 1)
+                      if "adrenotools_set_turbo" in ln
+                  )
+              )
+
+          # -------- 3C. turbo OFF ----------------------------------
+
+          turbo_off_pat = re.compile(
+              r'(#if\s+defined\s*\(\s*__ANDROID__\s*\)\s*'
+              r'&&\s*defined\s*\(\s*ARCHITECTURE_arm64\s*\)\s*)'
+              r'(?=\r?\n\s*adrenotools_set_turbo\s*\(\s*false\s*\))',
+              re.MULTILINE,
           )
 
-          text = text.replace(
-              old_true_v1,
-              new_true_v1,
-              1,
-          )
+          def turbo_off_replacer(m):
+              return (
+                  "#if defined(__ANDROID__) && "
+                  "defined(ARCHITECTURE_arm64) && "
+                  "!defined(YUZU_BIONIC_CLI)"
+              )
 
-          old_false_v1 = (
-              "#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)\n"
-              "\n"
-              "adrenotools_set_turbo(false);\n"
-              "\n"
-              "#endif"
-          )
-
-          new_false_v1 = (
-              "#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
-              "\n"
-              "adrenotools_set_turbo(false);\n"
-              "\n"
-              "#endif"
-          )
-
-          text = text.replace(
-              old_false_v1,
-              new_false_v1,
-              1,
-          )
-
-          # 兼容当前 Eden 可能已经采用单层 #if 的版本
-          old_true_v2 = (
-              "#ifdef ANDROID\n"
-              "adrenotools_set_turbo(true);\n"
-              "#else"
-          )
-
-          new_true_v2 = (
-              "#if defined(ANDROID) && defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
-              "adrenotools_set_turbo(true);\n"
-              "#else"
-          )
-
-          text = text.replace(
-              old_true_v2,
-              new_true_v2,
-              1,
-          )
-
-          old_false_v2 = (
-              "#ifdef ANDROID\n"
-              "adrenotools_set_turbo(false);\n"
-              "#endif"
-          )
-
-          new_false_v2 = (
-              "#if defined(ANDROID) && defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
-              "adrenotools_set_turbo(false);\n"
-              "#endif"
-          )
-
-          text = text.replace(
-              old_false_v2,
-              new_false_v2,
-              1,
-          )
+          # 注意：turbo(false) 只有在包含 set_turbo(true) 的那个 if 之后才可能命中，
+          # 但 include 已经先被替换过，这里是独立查找。
+          if turbo_off_pat.search(text):
+              text = turbo_off_pat.sub(turbo_off_replacer, text, count=1)
+              print("[BIONIC] turbo(false) patched.")
+          elif "adrenotools_set_turbo(false)" not in text:
+              print("[BIONIC] turbo(false) not present, skipping.")
+          else:
+              print(
+                  "[BIONIC] WARNING: turbo(false) pattern not matched, "
+                  "continuing anyway. Lines containing set_turbo(false):\n"
+                  + "\n".join(
+                      f"  L{i}: {ln}"
+                      for i, ln in enumerate(text.splitlines(), 1)
+                      if "adrenotools_set_turbo(false)" in ln
+                  )
+              )
 
           path.write_text(text)
 
-          print(
-              "vk_turbo_mode.cpp patched."
-          )
+          print("[BIONIC] vk_turbo_mode.cpp patched.")
           PY
 
           echo
           echo "============================================================"
-          echo "Verify AdrenoTools source guards"
+          echo "VERIFY externals/CMakeLists.txt"
           echo "============================================================"
 
-          echo "--- externals/CMakeLists.txt ---"
           grep -n \
             -A3 \
             -B3 \
@@ -1337,7 +1290,10 @@ jobs:
             externals/CMakeLists.txt || true
 
           echo
-          echo "--- video_core/CMakeLists.txt ---"
+          echo "============================================================"
+          echo "VERIFY video_core/CMakeLists.txt"
+          echo "============================================================"
+
           grep -n \
             -A3 \
             -B3 \
@@ -1345,10 +1301,13 @@ jobs:
             src/video_core/CMakeLists.txt || true
 
           echo
-          echo "--- vk_turbo_mode.cpp ---"
+          echo "============================================================"
+          echo "VERIFY vk_turbo_mode.cpp"
+          echo "============================================================"
+
           grep -n \
             -A5 \
-            -B3 \
+            -B4 \
             "adrenotools" \
             src/video_core/renderer_vulkan/vk_turbo_mode.cpp || true
 
