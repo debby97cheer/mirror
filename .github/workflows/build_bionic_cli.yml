@@ -1177,8 +1177,10 @@ jobs:
           PY
 
             # ============================================================
-      # ============================================================
-      # 18. 切断 Eden Android AdrenoTools / LinkerNSBypass
+            # ============================================================
+      
+     
+# 18. 切断 Eden Android AdrenoTools / LinkerNSBypass
       # ============================================================
       - name: Disable Android AdrenoTools for Bionic CLI
         shell: bash
@@ -1186,139 +1188,218 @@ jobs:
           set -eux
 
           python3 <<'PY'
-          from pathlib import Path
+          
+         
+from pathlib import Path
           import re
 
-          # ========================================================
-          # 1. externals/CMakeLists.txt
-          # ========================================================
-          path = Path("externals/CMakeLists.txt")
+          
+
+         
+# 1. externals/CMakeLists.txt
+          
+         
+path = Path("externals/CMakeLists.txt")
           text = path.read_text()
-
-          old = (
-              "if (ANDROID AND ARCHITECTURE_arm64)\n"
-              "    AddJsonPackage(libadrenotools)\n"
-              "endif()"
-          )
+          
+         
+old = (
+              
+             
+"if (ANDROID AND ARCHITECTURE_arm64)\n"
+              
+             
+"    AddJsonPackage(libadrenotools)\n"
+              
+             
+"endif()"
+          
+         
+)
           new = (
-              "if (ANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)\n"
-              "    AddJsonPackage(libadrenotools)\n"
+              "ifANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)\n"
+              
+             
+"    AddJsonPackage(libadrenotools)\n"
               "endif()"
-          )
-
+          
+         
+)
           if old in text:
-              text = text.replace(old, new, 1)
-              print("[BIONIC] externals: libadrenotools disabled.")
+              
+             
+text = text.replace(old, new, 1)
+              
+             
+print("[BIONIC] externals: libadrenotools disabled.")
           elif new in text:
-              print("[BIONIC] externals: already disabled.")
+              
+             
+print("[BIONIC] externals: already disabled.")
           else:
               raise SystemExit("ERROR: externals libadrenotools block not found.")
-          path.write_text(text)
+          
+         
+path.write_text(text)
 
-          # ========================================================
           # 2. src/video_core/CMakeLists.txt
-          # ========================================================
-          path = Path("src/video_core/CMakeLists.txt")
-          text = path.read_text()
-
+          
+         
+path = Path("src/video_core/CMakeLists.txt")
+          
+         
+text = path.read_text()
           old = (
-              "if (ANDROID AND ARCHITECTURE_arm64)\n"
+              
+             
+"if (ANDROID AND ARCHITECTURE_arm64)\n"
               "    target_link_libraries(video_core PRIVATE adrenotools)\n"
-              "endif()"
+              
+             
+"endif()"
           )
-          new = (
-              "if (ANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)\n"
-              "    target_link_libraries(video_core PRIVATE adrenotools)\n"
+          
+         
+new = (
+              
+             
+"if (ANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)\n"
+              
+             
+"    target_link_libraries(video_core PRIVATE adrenotools)\n"
               "endif()"
-          )
-
+          
+         
+)
           if old in text:
-              text = text.replace(old, new, 1)
-              print("[BIONIC] video_core: adrenotools link disabled.")
+              
+             
+text = text.replace(old, new, 1)
+              
+             
+print("[BIONIC] video_core: adrenotools link disabled.")
           elif new in text:
-              print("[BIONIC] video_core: already disabled.")
-          else:
+              
+             
+print("[BIONIC] video_core: already disabled.")
+          
+         
+else:
               raise SystemExit("ERROR: video_core adrenotools block not found.")
-          path.write_text(text)
+          
+         
+path.write_text(text)
 
-          # ========================================================
-          # 3. 创建 adrenotools stub header
-          # ========================================================
-          stub_path = Path("src/video_core/vulkan_common/adrenotools_bionic_stub.h")
+          # 3. Create stub header
+          
+         
+stub_path = Path("src/video_core/vulkan_common/adrenotools_bionic_stub.h")
           stub_path.parent.mkdir(parents=True, exist_ok=True)
-
-          stub_path.write_text(r'''// SPDX-FileCopyrightText: 2026 Eden Emulator Project
+          
+         
+stub_path.write_text("""\
+// SPDX-FileCopyrightText: 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
+
+#if defined(YUZU_BIONIC_CLI)
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#if defined(YUZU_BIONIC_CLI)
-
-/* ---- adrenotools BCN patcher ---- */
 #define ADRENOTOOLS_BCN_NO_PATCH 0
 #define ADRENOTOOLS_BCN_PATCH    1
 #define ADRENOTOOLS_BCN_BLOB     2
 
 static inline int adrenotools_get_bcn_type(int major, int minor, int vendor) {
-    (void)major; (void)minor; (void)vendor;
-    return ADRENOTOOLS_BCN_NO_PATCH;
+    
+   
+(void)major; (void)minor; (void)vendor;
+    
+   
+return ADRENOTOOLS_BCN_NO_PATCH;
 }
 
 static inline int adrenotools_patch_bcn(void* vkGetPhysicalDeviceFormatProperties) {
     (void)vkGetPhysicalDeviceFormatProperties;
-    return 0; /* false: no BCN patch applied */
+    
+   
+return 0;
 }
 
-/* ---- adrenotools turbo / driver hooks (fill more as needed) ---- */
 static inline void* adrenotools_api_create(void) { return (void*)0; }
 static inline void  adrenotools_api_destroy(void* api) { (void)api; }
 
-/* ---- bcenabler hooks ---- */
 static inline int bcenabler_patch_gpu_driver(void* target_device_extension) {
     (void)target_device_extension;
-    return 0;
+    
+   
+return 0;
 }
 static inline int bcenabler_apply_standard_patch(void) { return 0; }
-
-#endif /* YUZU_BIONIC_CLI */
 
 #ifdef __cplusplus
 }
 #endif
-''')
-          print(f"[BIONIC] created {stub_path}")
 
-          # ========================================================
-          # 4. 全源码扫描并替换 adrenotools include
-          # ========================================================
-          include_re = re.compile(
-              r'^([ \t]*)#\s*include\s*<(adrenotools/[a-zA-Z0-9_./]+)>[ \t]*$',
-              re.MULTILINE,
-          )
+#endif /* YUZU_BIONIC_CLI */
+""")
+          print("[BIONIC] stub header created")
 
-          # 清理旧补丁的 regex
+          
+
+         
+# 4. Clean and replace adrenotools includes in source
+          
+         
+include_re = re.compile(
+              
+             
+r'^([ \t]*)#\s*include\s*<(adrenotools/[a-zA-Z0-9_./]+)>[ \t]*$',
+              
+             
+re.MULTILINE,
+          
+         
+)
+
           stale_guard_re = re.compile(
               r'[ \t]*#if\s+!defined\s*\(\s*YUZU_BIONIC_CLI\s*\)[ \t]*\r?\n'
               r'[ \t]*#\s*include\s*<adrenotools/[a-zA-Z0-9_./]+>[ \t]*\r?\n'
-              r'[ \t]*#endif[ \t]*\r?\n?',
-          )
+              
+             
+r'[ \t]*#endif[ \t]*\r?\n?',
+          
+         
+)
           stale_macro_re = re.compile(
-              r'[ \t]*#if\s+defined\s*\(\s*YUZU_BIONIC_CLI\s*\)[ \t]*\r?\n'
+              
+             
+r'[ \t]*#if\s+defined\s*\(\s*YUZU_BIONIC_CLI\s*\)[ \t]*\r?\n'
               r'(?:[ \t]*#define[ \t]+(?:adrenotools|bcenabler)_[A-Za-z0-9_]+\([^\n]*\r?\n)+'
-              r'[ \t]*#endif[ \t]*\r?\n?',
+              
+             
+r'[ \t]*#endif[ \t]*\r?\n?',
           )
 
-          targets = []
-          for ext in (".cpp", ".c", ".h", ".hpp", ".cc"):
+          
+
+         
+targets = []
+          
+         
+for ext in (".cpp", ".c", ".h", ".hpp", ".cc"):
               for p in Path("src").rglob(f"*{ext}"):
                   try:
                       t = p.read_text()
-                  except Exception:
-                      continue
+                  
+                 
+except Exception:
+                      
+                     
+continue
                   if "adrenotools" in t or "bcenabler" in t:
                       targets.append(p)
 
@@ -1328,33 +1409,86 @@ static inline int bcenabler_apply_standard_patch(void) { return 0; }
               text = path.read_text()
               original = text
 
-              # 删除旧 guard
+              
+
+# Remove old guard blocks
               for _ in range(5):
-                  new_text = stale_guard_re.sub("", text)
+                  
+                 
+new_text = stale_guard_re.sub("", text)
                   if new_text == text:
                       break
                   text = new_text
 
-              # 删除旧 ((void)0) 宏块
-              while True:
- new_text = stale_macro_re.sub("", text)
+              
+
+# Remove old no-op macro blocks
+              
+             
+while True:
+                  
+                 
+new_text = stale_macro_re.sub("", text)
                   if new_text == text:
-                      break
+                      
+                     
+break
                   text = new_text
 
-              # 替换 include：Bionic 下用 stub header
-              def replace_inc(m):
-                  indent = m.group(1)
-                  inc = m.group(0).lstrip()
+              
+
+# Replace adrenotools includes with conditional includes
+              
+             
+def replace_inc(m):
+                  
+                 
+indent = m.group(1)
+ inc = m.group(0).lstrip()
                   return (
                       f"{indent}#if !defined(YUZU_BIONIC_CLI)\n"
-                      f"{indent}{inc}\n"
+                      
+                     
+f"{indent}{inc}\n"
                       f"{indent}#else\n"
-                      f'{indent}#include "video_core/vulkan_common/adrenotools_bionic_stub.h"\n'
+                      
+                     
+f'{indent}#include "video_core/vulkan_common/adrenotools_bionic_stub.h"\n'
                       f"{indent}#endif"
                   )
 
-              text = include_re.sub(replace_inc, text)
+              
+
+             
+text = include_re.sub(replace_inc, text)
+
+              
+
+             
+# Fallback: if include was already removed, add stub include at top
+              
+             
+if "adrenotools" in text and "adrenotools_bionic_stub.h" not in text:
+                  
+                 
+lines = text.splitlines(keepends=True)
+                  
+                 
+insert_idx = 0
+                  for i, ln in enumerate(lines):
+                      
+                     
+if ln.strip().startswith("#include"):
+                          
+                         
+insert_idx = i + 1
+                  lines.insert(insert_idx, '#if defined(YUZU_BIONIC_CLI)\n')
+                  
+                 
+lines.insert(insert_idx + 1, '#include "video_core/vulkan_common/adrenotools_bionic_stub.h"\n')
+                  lines.insert(insert_idx + 2, '#endif\n')
+                  text = "".join(lines)
+                  print(f"[BIONIC] fallback stub include added to {path}")
 
               if text != original:
                   path.write_text(text)
@@ -1363,16 +1497,12 @@ static inline int bcenabler_apply_standard_patch(void) { return 0; }
           print("[BIONIC] all adrenotools references neutralized.")
           PY
 
-          echo
-          echo "VERIFY externals/CMakeLists.txt"
-          grep -n -A3 -B3 "libadrenotools" externals/CMakeLists.txt || true
-          echo
-          echo "VERIFY video_core/CMakeLists.txt"
-          grep -n -A3 -B3 "adrenotools" src/video_core/CMakeLists.txt || true
-          echo
-          echo "VERIFY vulkan_device.cpp"
-          grep -n -A6 -B2 "adrenotools\|bcenabler\|adrenotools_bionic_stub" \
+          echo "==== VERIFY ===="
+          grep -n "libadrenotools" externals/CMakeLists.txt || true
+          grep -n "adrenotools" src/video_core/CMakeLists.txt || true
+          grep -n "adrenotools_bionic_stub" \
             src/video_core/vulkan_common/vulkan_device.cpp || true
+
       # ============================================================
       # 19. Headless EmuWindow
       # ============================================================
