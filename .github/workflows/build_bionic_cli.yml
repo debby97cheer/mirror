@@ -1176,7 +1176,7 @@ jobs:
                   )
           PY
 
-             # ============================================================
+      # ============================================================
       # 18. 切断 Eden Android AdrenoTools / LinkerNSBypass
       #
       # 目标：Bionic CLI 下完全不引入任何 Android GPU 驱动层
@@ -1186,11 +1186,12 @@ jobs:
       # 处理：
       #   - externals：不构建 libadrenotools
       #   - video_core：不链接 adrenotools
-      #   - vk_turbo_mode.cpp：
-      #       * 顶层插入 no-op 宏 adrenotools_set_turbo(...) ((void)0)
-      #       * 把 #include <adrenotools/driver.h> 用
-      #         #if !defined(YUZU_BIONIC_CLI) ... #endif 包裹
-      #       * 不再猜外层 #if 结构
+      #   - 全源码扫描：
+      #       * 所有 #include <adrenotools/...> 加 Bionic guard
+      #       * 所有 adrenotools_* / bcenabler_* 函数调用加 no-op 宏
+      #
+      # 这样无论是 driver.h、bcenabler.h 还是未来新增的头文件，
+      # 都不会因为“文件不在 include 路径”而报 fatal error。
       # ============================================================
       - name: Disable Android AdrenoTools for Bionic CLI
         shell: bash
@@ -1264,88 +1265,104 @@ jobs:
           path.write_text(text)
 
           # ========================================================
-          # 3. vk_turbo_mode.cpp
+          # 3. 全源码扫描
+          #
+          # 遍历 src/ 下所有 .cpp/.h/.hpp/.c/.cc，
+          # 找出所有引用 adrenotools / bcenabler 的文件。
           # ========================================================
 
-          path = Path(
-              "src/video_core/renderer_vulkan/vk_turbo_mode.cpp"
+          targets = []
+
+          for ext in ("*.cpp", "*.h", "*.hpp", "*.c", "*.cc"):
+              for p in Path("src").rglob(ext):
+                  try:
+                      t = p.read_text()
+                  except Exception:
+                      continue
+
+                  if "adrenotools" in t or "bcenabler" in t:
+                      targets.append(p)
+
+          print(
+              f"[BIONIC] scanning {len(targets)} file(s) with "
+              f"adrenotools/bcenabler references."
           )
 
-          text = path.read_text()
-
-          # -------- 3A. 顶层插入 no-op 宏 --------------------------
-
-          macro_block = (
-              "#if defined(YUZU_BIONIC_CLI)\n"
-              "#define adrenotools_set_turbo(...) ((void)0)\n"
-              "#endif\n"
+          include_re = re.compile(
+              r'#\s*include\s*<(adrenotools/[^>]+)>'
           )
 
-          if "#define adrenotools_set_turbo" in text:
-              print("[BIONIC] no-op macro already present.")
-          else:
-              first_include = re.search(
-                  r'^[ \t]*#\s*include\b',
-                  text,
-                  re.MULTILINE,
-              )
+          ident_re = re.compile(
+              r'\b((?:adrenotools|bcenabler)_[A-Za-z0-9_]+)\s*\('
+          )
 
-              if not first_include:
-                  raise SystemExit(
-                      "ERROR: no #include found in vk_turbo_mode.cpp."
+          for path in targets:
+
+              text = path.read_text()
+              original = text
+
+              # ------------------------------------------------
+              # 3A. Guard adrenotools includes
+              # ------------------------------------------------
+
+              for m in list(include_re.finditer(text)):
+                  inc = m.group(0)
+
+                  wrapped = (
+                      "#if !defined(YUZU_BIONIC_CLI)\n"
+                      + inc + "\n"
+                      + "#endif"
                   )
 
-              insert_pos = first_include.start()
-              line_start = text.rfind("\n", 0, insert_pos) + 1
+                  if wrapped in text:
+                      continue
 
-              text = (
-                  text[:line_start]
-                  + macro_block
-                  + text[line_start:]
-              )
+                  if inc in text:
+                      text = text.replace(inc, wrapped, 1)
 
-              print("[BIONIC] no-op macro inserted.")
+              # ------------------------------------------------
+              # 3B. No-op macros for adrenotools / bcenabler calls
+              # ------------------------------------------------
 
-          # -------- 3B. 无条件包裹 adrenotools include -------------
-          #
-          # 不再假设外层是 #if defined(__ANDROID__) ...
-          # 只把 include 行本身包起来。
-          # 无论原文件有没有外层 guard，都能保证
-          # YUZU_BIONIC_CLI 下不真正 include。
-          # --------------------------------------------------------
+              idents = set(m.group(1) for m in ident_re.finditer(text))
 
-          include_line = "#include <adrenotools/driver.h>"
+              new_macros = []
 
-          already_wrapped = (
-              "#if !defined(YUZU_BIONIC_CLI)\n" + include_line in text
-              or
-              "#if !defined(YUZU_BIONIC_CLI)\r\n" + include_line in text
-          )
+              for ident in sorted(idents):
+                  if f"#define {ident}" in text:
+                      continue
+                  new_macros.append(
+                      f"#define {ident}(...) ((void)0)"
+                  )
 
-          if include_line not in text:
-              print("[BIONIC] no adrenotools include found; skipping.")
-          elif already_wrapped:
-              print("[BIONIC] include already wrapped.")
-          else:
-              wrapped = (
-                  "#if !defined(YUZU_BIONIC_CLI)\n"
-                  + include_line + "\n"
-                  + "#endif"
-              )
+              if new_macros:
+                  block = (
+                      "#if defined(YUZU_BIONIC_CLI)\n"
+                      + "\n".join(new_macros) + "\n"
+                      + "#endif\n"
+                  )
 
-              text = text.replace(
-                  include_line,
-                  wrapped,
-                  1,
-              )
+                  first_include = re.search(
+                      r'^[ \t]*#\s*include\b',
+                      text,
+                      re.MULTILINE,
+                  )
 
-              print(
-                  "[BIONIC] include wrapped with !defined(YUZU_BIONIC_CLI)."
-              )
+                  if first_include:
+                      line_start = (
+                          text.rfind("\n", 0, first_include.start()) + 1
+                      )
+                      text = (
+                          text[:line_start]
+                          + block
+                          + text[line_start:]
+                      )
 
-          path.write_text(text)
+              if text != original:
+                  path.write_text(text)
+                  print(f"[BIONIC] patched {path}")
 
-          print("[BIONIC] vk_turbo_mode.cpp patched.")
+          print("[BIONIC] all adrenotools references neutralized.")
           PY
 
           echo
@@ -1380,6 +1397,17 @@ jobs:
             -B3 \
             "adrenotools" \
             src/video_core/renderer_vulkan/vk_turbo_mode.cpp || true
+
+          echo
+          echo "============================================================"
+          echo "VERIFY vulkan_device.cpp"
+          echo "============================================================"
+
+          grep -n \
+            -A4 \
+            -B3 \
+            "adrenotools\|bcenabler" \
+            src/video_core/vulkan_common/vulkan_device.cpp || true
       # ============================================================
       # 19. Headless EmuWindow
       # ============================================================
