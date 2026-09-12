@@ -378,14 +378,14 @@ jobs:
               )
           PY
 
-      # ============================================================
-      # 8. Patch 根 CMake
+            # ============================================================
+      # 8. Patch Root CMake
       #
-      # 注册：
+      # 注册 YUZU_BIONIC_CLI，并在所有目标创建完成后，
+      # 从整棵 target 树的 LINK / INTERFACE_LINK
+      # 依赖里剥掉 android / -landroid / libandroid.so。
       #
-      #   YUZU_BIONIC_CLI
-      #
-      # 同时清理 FFmpeg / 第三方库传导的 mediandk。
+      # 这一步用于根除最终 build.ninja 里残留的 -landroid。
       # ============================================================
       - name: Patch Root CMake
         shell: bash
@@ -400,7 +400,7 @@ jobs:
           text = path.read_text()
 
           # --------------------------------------------------------
-          # YUZU_CMD
+          # 1. YUZU_CMD
           # --------------------------------------------------------
 
           pattern = re.compile(
@@ -419,20 +419,16 @@ jobs:
           )
 
           if count:
-              print(
-                  "YUZU_CMD Android restriction removed."
-              )
+              print("[BIONIC] YUZU_CMD restriction removed.")
           elif replacement in text:
-              print(
-                  "YUZU_CMD already enabled."
-              )
+              print("[BIONIC] YUZU_CMD already patched.")
           else:
               raise SystemExit(
                   "ERROR: YUZU_CMD declaration not found."
               )
 
           # --------------------------------------------------------
-          # YUZU_BIONIC_CLI
+          # 2. YUZU_BIONIC_CLI
           # --------------------------------------------------------
 
           if "option(YUZU_BIONIC_CLI" not in text:
@@ -454,12 +450,13 @@ jobs:
                   1,
               )
 
-              print(
-                  "Added YUZU_BIONIC_CLI."
-              )
+              print("[BIONIC] YUZU_BIONIC_CLI added.")
+          else:
+              print("[BIONIC] YUZU_BIONIC_CLI already present.")
 
           # --------------------------------------------------------
-          # FFmpeg / imported target filtering
+          # 3. 保留原有 FFmpeg imported target 清理
+          #    （只做 mediandk，避免改动原有行为）
           # --------------------------------------------------------
 
           ffmpeg_filter_block = "\n".join(
@@ -547,13 +544,126 @@ jobs:
               ]
           )
 
-          text += ffmpeg_filter_block
+          # 防止重复追加
+          if "Bionic CLI: Strip Android-only imported dependencies" not in text:
+              text += ffmpeg_filter_block
+
+          # --------------------------------------------------------
+          # 4. 关键新增：延迟清理 android/-landroid
+          #
+          # 依赖 CMake 3.19+ 的 cmake_language(DEFER CALL)
+          #
+          # 在所有 CMakeLists.txt 处理完之后，
+          # 遍历整棵 target 树，从 LINK_LIBRARIES /
+          # INTERFACE_LINK_LIBRARIES 中移除：
+          #
+          #     android
+          #     -landroid
+          #     libandroid.so
+          #     $<LINK_ONLY:android>
+          # --------------------------------------------------------
+
+          bionic_defer_block = "\n".join(
+              [
+                  "",
+                  "# ===========================================================================",
+                  "# BIONIC CLI: final deferred Android dependency sanitizer",
+                  "# ===========================================================================",
+                  "if (YUZU_BIONIC_CLI)",
+                  "",
+                  "    function(_bionic_strip_android_from_target _target)",
+                  "",
+                  "        if (NOT TARGET ${_target})",
+                  "            return()",
+                  "        endif()",
+                  "",
+                  "        foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)",
+                  "",
+                  "            get_target_property(_libs ${_target} ${_prop})",
+                  "",
+                  "            if (NOT _libs)",
+                  "                continue()",
+                  "            endif()",
+                  "",
+                  "            if (\"${_libs}\" STREQUAL \"${_prop}-NOTFOUND\")",
+                  "                continue()",
+                  "            endif()",
+                  "",
+                  "            set(_filtered \"\")",
+                  "",
+                  "            foreach(_lib IN LISTS _libs)",
+                  "",
+                  "                set(_strip FALSE)",
+                  "",
+                  "                if (_lib STREQUAL \"android\" OR _lib STREQUAL \"-landroid\")",
+                  "                    set(_strip TRUE)",
+                  "                endif()",
+                  "",
+                  "                if (_lib MATCHES \"libandroid\\\\.so\")",
+                  "                    set(_strip TRUE)",
+                  "                endif()",
+                  "",
+                  "                if (_lib MATCHES \"^\\\\$<LINK_ONLY:android>$\")",
+                  "                    set(_strip TRUE)",
+                  "                endif()",
+                  "",
+                  "                if (_strip)",
+                  "                    message(STATUS \"[BIONIC] DEFER strip '${_lib}' from ${_target} ${_prop}\")",
+                  "                else()",
+                  "                    list(APPEND _filtered \"${_lib}\")",
+                  "                endif()",
+                  "",
+                  "            endforeach()",
+                  "",
+                  "            set_target_properties(",
+                  "                ${_target}",
+                  "                PROPERTIES",
+                  "                ${_prop}",
+                  "                \"${_filtered}\"",
+                  "            )",
+                  "",
+                  "        endforeach()",
+                  "",
+                  "    endfunction()",
+                  "",
+                  "    function(_bionic_strip_android_from_dir _dir)",
+                  "",
+                  "        if (NOT _dir)",
+                  "            return()",
+                  "        endif()",
+                  "",
+                  "        get_property(_targets DIRECTORY \"${_dir}\" PROPERTY BUILDSYSTEM_TARGETS)",
+                  "",
+                  "        foreach(_t IN LISTS _targets)",
+                  "            _bionic_strip_android_from_target(${_t})",
+                  "        endforeach()",
+                  "",
+                  "        get_property(_subdirs DIRECTORY \"${_dir}\" PROPERTY SUBDIRECTORIES)",
+                  "",
+                  "        foreach(_sub IN LISTS _subdirs)",
+                  "            _bionic_strip_android_from_dir(\"${_sub}\")",
+                  "        endforeach()",
+                  "",
+                  "    endfunction()",
+                  "",
+                  "    cmake_language(",
+                  "        DEFER",
+                  "        DIRECTORY \"${CMAKE_SOURCE_DIR}\"",
+                  "        CALL _bionic_strip_android_from_dir",
+                  "        \"${CMAKE_SOURCE_DIR}\"",
+                  "    )",
+                  "",
+                  "endif()",
+                  "",
+              ]
+          )
+
+          if "final deferred Android dependency sanitizer" not in text:
+              text += bionic_defer_block
 
           path.write_text(text)
 
-          print(
-              "Root CMake patched."
-          )
+          print("[BIONIC] Root CMake patched (deferred android sanitizer installed).")
           PY
 
       # ============================================================
