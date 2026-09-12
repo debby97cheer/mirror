@@ -1104,13 +1104,17 @@ jobs:
           path = Path("externals/CMakeLists.txt")
           text = path.read_text()
 
-          old = """if (ANDROID AND ARCHITECTURE_arm64)
-    AddJsonPackage(libadrenotools)
-endif()"""
+          old = (
+              "if (ANDROID AND ARCHITECTURE_arm64)\n"
+              "    AddJsonPackage(libadrenotools)\n"
+              "endif()"
+          )
 
-          new = """if (ANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)
-    AddJsonPackage(libadrenotools)
-endif()"""
+          new = (
+              "if (ANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)\n"
+              "    AddJsonPackage(libadrenotools)\n"
+              "endif()"
+          )
 
           if old in text:
               text = text.replace(old, new, 1)
@@ -1139,18 +1143,23 @@ endif()"""
           text = path.read_text()
 
           old_variants = [
-              """if (ANDROID AND ARCHITECTURE_arm64)
-    target_link_libraries(video_core PRIVATE adrenotools)
-endif()""",
-
-              """if(ANDROID AND ARCHITECTURE_arm64)
-    target_link_libraries(video_core PRIVATE adrenotools)
-endif()""",
+              (
+                  "if (ANDROID AND ARCHITECTURE_arm64)\n"
+                  "    target_link_libraries(video_core PRIVATE adrenotools)\n"
+                  "endif()"
+              ),
+              (
+                  "if(ANDROID AND ARCHITECTURE_arm64)\n"
+                  "    target_link_libraries(video_core PRIVATE adrenotools)\n"
+                  "endif()"
+              ),
           ]
 
-          new = """if (ANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)
-    target_link_libraries(video_core PRIVATE adrenotools)
-endif()"""
+          new = (
+              "if (ANDROID AND ARCHITECTURE_arm64 AND NOT YUZU_BIONIC_CLI)\n"
+              "    target_link_libraries(video_core PRIVATE adrenotools)\n"
+              "endif()"
+          )
 
           patched = False
 
@@ -1182,19 +1191,21 @@ endif()"""
 
           text = path.read_text()
 
-          old_include = """#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
+          old_include = (
+              "#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)\n"
+              "\n"
+              "#include <adrenotools/driver.h>\n"
+              "\n"
+              "#endif"
+          )
 
-#include <adrenotools/driver.h>
-
-#endif"""
-
-          new_include = """#if defined(__ANDROID__) && \
-defined(ARCHITECTURE_arm64) && \
-!defined(YUZU_BIONIC_CLI)
-
-#include <adrenotools/driver.h>
-
-#endif"""
+          new_include = (
+              "#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
+              "\n"
+              "#include <adrenotools/driver.h>\n"
+              "\n"
+              "#endif"
+          )
 
           if old_include in text:
               text = text.replace(
@@ -1215,70 +1226,94 @@ defined(ARCHITECTURE_arm64) && \
               )
 
           # --------------------------------------------------------
-          # Replace three Android/adrenotools conditions.
+          # Replace Android/adrenotools turbo conditions.
           #
           # 1. set_turbo(true)
           # 2. set_turbo(false)
           # --------------------------------------------------------
 
-          text = text.replace(
-              """#ifdef __ANDROID__
+          old_true_v1 = (
+              "#ifdef __ANDROID__\n"
+              "\n"
+              "#ifdef ARCHITECTURE_arm64\n"
+              "\n"
+              "adrenotools_set_turbo(true);\n"
+              "\n"
+              "#endif\n"
+              "\n"
+              "#else"
+          )
 
-#ifdef ARCHITECTURE_arm64
-
-adrenotools_set_turbo(true);
-
-#endif
-
-#else""",
-              """#if defined(__ANDROID__) && \
-defined(ARCHITECTURE_arm64) && \
-!defined(YUZU_BIONIC_CLI)
-
-adrenotools_set_turbo(true);
-
-#else""",
-              1,
+          new_true_v1 = (
+              "#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
+              "\n"
+              "adrenotools_set_turbo(true);\n"
+              "\n"
+              "#else"
           )
 
           text = text.replace(
-              """#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)
+              old_true_v1,
+              new_true_v1,
+              1,
+          )
 
-adrenotools_set_turbo(false);
+          old_false_v1 = (
+              "#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64)\n"
+              "\n"
+              "adrenotools_set_turbo(false);\n"
+              "\n"
+              "#endif"
+          )
 
-#endif""",
-              """#if defined(__ANDROID__) && \
-defined(ARCHITECTURE_arm64) && \
-!defined(YUZU_BIONIC_CLI)
+          new_false_v1 = (
+              "#if defined(__ANDROID__) && defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
+              "\n"
+              "adrenotools_set_turbo(false);\n"
+              "\n"
+              "#endif"
+          )
 
-adrenotools_set_turbo(false);
-
-#endif""",
+          text = text.replace(
+              old_false_v1,
+              new_false_v1,
               1,
           )
 
           # 兼容当前 Eden 可能已经采用单层 #if 的版本
-          text = text.replace(
-              """#ifdef ANDROID
-adrenotools_set_turbo(true);
-#else""",
-              """#if defined(ANDROID) && \
-defined(ARCHITECTURE_arm64) && \
-!defined(YUZU_BIONIC_CLI)
-adrenotools_set_turbo(true);
-#else""",
-              1,
+          old_true_v2 = (
+              "#ifdef ANDROID\n"
+              "adrenotools_set_turbo(true);\n"
+              "#else"
+          )
+
+          new_true_v2 = (
+              "#if defined(ANDROID) && defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
+              "adrenotools_set_turbo(true);\n"
+              "#else"
           )
 
           text = text.replace(
-              """#ifdef ANDROID
-adrenotools_set_turbo(false);
-#endif""",
-              """#if defined(ANDROID) && \
-defined(ARCHITECTURE_arm64) && \
-!defined(YUZU_BIONIC_CLI)
-adrenotools_set_turbo(false);
-#endif""",
+              old_true_v2,
+              new_true_v2,
+              1,
+          )
+
+          old_false_v2 = (
+              "#ifdef ANDROID\n"
+              "adrenotools_set_turbo(false);\n"
+              "#endif"
+          )
+
+          new_false_v2 = (
+              "#if defined(ANDROID) && defined(ARCHITECTURE_arm64) && !defined(YUZU_BIONIC_CLI)\n"
+              "adrenotools_set_turbo(false);\n"
+              "#endif"
+          )
+
+          text = text.replace(
+              old_false_v2,
+              new_false_v2,
               1,
           )
 
